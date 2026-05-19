@@ -1,0 +1,270 @@
+#!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const ROOT = path.resolve(path.dirname(__filename), '..');
+const HOME = os.homedir();
+const LABEL = 'com.feishu-agent-router';
+const PLIST_PATH = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
+const ENV_PATH = path.join(ROOT, '.env');
+
+loadDotEnv(ENV_PATH);
+
+const FTB_HOME = env('FTB_HOME', path.join(HOME, '.feishu-agent-router'));
+const LOG_DIR = path.join(FTB_HOME, 'logs');
+const NODE = process.execPath;
+const UID = process.getuid?.() ?? Number(run('id', ['-u']).trim());
+
+fs.mkdirSync(LOG_DIR, { recursive: true });
+
+const command = process.argv[2] || 'help';
+const rest = process.argv.slice(3);
+
+try {
+  switch (command) {
+    case 'install':
+      install();
+      break;
+    case 'uninstall':
+      uninstall();
+      break;
+    case 'start':
+      start();
+      break;
+    case 'stop':
+      stop();
+      break;
+    case 'restart':
+      restart();
+      break;
+    case 'status':
+      status();
+      break;
+    case 'logs':
+      logs(rest);
+      break;
+    case 'doctor':
+      passthroughDoctor();
+      break;
+    case 'plist':
+      process.stdout.write(renderPlist());
+      break;
+    case 'help':
+    case '--help':
+    case '-h':
+      help();
+      break;
+    default:
+      throw new Error(`Unknown command: ${command}`);
+  }
+} catch (error) {
+  console.error(`farctl: ${error.message || String(error)}`);
+  process.exit(1);
+}
+
+function install() {
+  if (!fs.existsSync(ENV_PATH)) {
+    throw new Error(`Missing ${ENV_PATH}. Create it from .env.example first.`);
+  }
+  fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
+  fs.writeFileSync(PLIST_PATH, renderPlist());
+  console.log(`Installed ${PLIST_PATH}`);
+  bootstrap();
+  console.log('Service installed and started.');
+  status();
+}
+
+function uninstall() {
+  bootout({ ignoreMissing: true });
+  if (fs.existsSync(PLIST_PATH)) {
+    fs.unlinkSync(PLIST_PATH);
+    console.log(`Removed ${PLIST_PATH}`);
+  }
+  console.log('Service uninstalled. Runtime data was kept at:');
+  console.log(FTB_HOME);
+}
+
+function start() {
+  if (!fs.existsSync(PLIST_PATH)) {
+    fs.writeFileSync(PLIST_PATH, renderPlist());
+    console.log(`Installed ${PLIST_PATH}`);
+  }
+  bootstrap();
+  status();
+}
+
+function stop() {
+  bootout({ ignoreMissing: true });
+  status();
+}
+
+function restart() {
+  bootout({ ignoreMissing: true });
+  bootstrap();
+  status();
+}
+
+function status() {
+  const result = spawnSync('launchctl', ['print', domainTarget()], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    console.log(`Service ${LABEL}: not loaded`);
+    return;
+  }
+  const pid = result.stdout.match(/\bpid = (\d+)/)?.[1];
+  const state = result.stdout.match(/\bstate = ([^\n]+)/)?.[1]?.trim();
+  console.log(`Service ${LABEL}: loaded`);
+  console.log(`state: ${state || 'unknown'}`);
+  console.log(`pid: ${pid || '-'}`);
+  console.log(`plist: ${PLIST_PATH}`);
+  console.log(`home: ${FTB_HOME}`);
+}
+
+function logs(args) {
+  const kind = args[0] === 'err' ? 'err' : args[0] === 'out' ? 'out' : 'router';
+  const file = kind === 'router'
+    ? path.join(LOG_DIR, 'router.log')
+    : path.join(LOG_DIR, `launchd.${kind}.log`);
+  const lines = args.includes('-f') ? null : Number.parseInt(args.find((x) => /^\d+$/.test(x)) || '120', 10);
+  if (!fs.existsSync(file)) {
+    console.log(`No log file yet: ${file}`);
+    return;
+  }
+  if (args.includes('-f')) {
+    spawnSync('tail', ['-f', file], { stdio: 'inherit' });
+  } else {
+    spawnSync('tail', ['-n', String(lines), file], { stdio: 'inherit' });
+  }
+}
+
+function passthroughDoctor() {
+  const result = spawnSync(NODE, [path.join(ROOT, 'bin', 'doctor.mjs')], {
+    cwd: ROOT,
+    stdio: 'inherit',
+  });
+  process.exitCode = result.status || 0;
+}
+
+function bootstrap() {
+  bootout({ ignoreMissing: true });
+  const result = spawnSync('launchctl', ['bootstrap', `gui/${UID}`, PLIST_PATH], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || 'launchctl bootstrap failed');
+  }
+  spawnSync('launchctl', ['kickstart', '-k', domainTarget()], { encoding: 'utf8' });
+}
+
+function bootout({ ignoreMissing } = {}) {
+  const result = spawnSync('launchctl', ['bootout', `gui/${UID}`, PLIST_PATH], { encoding: 'utf8' });
+  if (result.status !== 0 && !ignoreMissing) {
+    throw new Error(result.stderr || result.stdout || 'launchctl bootout failed');
+  }
+}
+
+function domainTarget() {
+  return `gui/${UID}/${LABEL}`;
+}
+
+function renderPlist() {
+  const envObject = {
+    PATH: [
+      path.dirname(NODE),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+      '/usr/sbin',
+      '/sbin',
+    ].join(':'),
+    HOME,
+    FTB_HOME,
+  };
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xml(NODE)}</string>
+    <string>${xml(path.join(ROOT, 'bin', 'bridge.mjs'))}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${xml(ROOT)}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+${Object.entries(envObject).map(([key, value]) => `    <key>${xml(key)}</key>\n    <string>${xml(value)}</string>`).join('\n')}
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${xml(path.join(LOG_DIR, 'launchd.out.log'))}</string>
+  <key>StandardErrorPath</key>
+  <string>${xml(path.join(LOG_DIR, 'launchd.err.log'))}</string>
+</dict>
+</plist>
+`;
+}
+
+function loadDotEnv(file) {
+  if (!fs.existsSync(file)) return;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value.replace(/\\"/g, '"');
+  }
+}
+
+function env(name, fallback) {
+  const value = process.env[name];
+  return value && value.trim() ? value.trim() : fallback;
+}
+
+function run(cmd, args) {
+  const result = spawnSync(cmd, args, { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+  return result.stdout;
+}
+
+function xml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function help() {
+  console.log(`Usage: farctl <command>
+
+Commands:
+  install      Install launchd service and start it
+  uninstall    Stop service and remove launchd plist
+  start        Start service
+  stop         Stop service
+  restart      Restart service
+  status       Show launchd status
+  logs [kind]  Show logs; kind: router|out|err; add -f to follow
+  doctor       Run environment checks
+  plist        Print generated launchd plist
+`);
+}

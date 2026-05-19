@@ -1,0 +1,19 @@
+{
+  "name": "feishu-agent-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Feishu official-events router to persistent tmux-backed agent sessions.",
+  "scripts": {
+    "start": "node bin/bridge.mjs",
+    "doctor": "node bin/doctor.mjs",
+    "check": "node --check bin/bridge.mjs && node --check bin/doctor.mjs && node --check bin/farctl.mjs",
+    "service": "node bin/farctl.mjs"
+  },
+  "bin": {
+    "farctl": "bin/farctl.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
