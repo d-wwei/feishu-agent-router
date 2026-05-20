@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +31,13 @@ import {
   ensureAutoGroupSession,
   shouldIgnorePlainGroupMessage,
 } from '../lib/session-routing.mjs';
+import { evaluateAllowlist } from '../lib/allowlist-policy.mjs';
+import {
+  buildLarkCliArgs,
+  parseLarkProfileList,
+  resolveLarkBotIdentity,
+  safeLarkBotLockKey,
+} from '../lib/lark-cli.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -56,6 +64,8 @@ for (const dir of [DATA_DIR, LOG_DIR, INBOX_DIR]) {
 
 const cfg = {
   larkAs: env('FTB_LARK_AS', 'bot'),
+  larkProfile: env('FTB_LARK_PROFILE', ''),
+  larkAppId: env('FTB_LARK_APP_ID', ''),
   allowedSenders: csvEnv('FTB_ALLOWED_SENDERS'),
   allowedChats: csvEnv('FTB_ALLOWED_CHATS'),
   adminUsers: csvEnv('FTB_ADMIN_USERS', env('FTB_ALLOWED_SENDERS', '')),
@@ -102,8 +112,10 @@ const cfg = {
 let state = loadState();
 let queue = Promise.resolve();
 let shuttingDown = false;
+validateExplicitLarkBotConfig();
+const larkBotLock = acquireLarkBotLock();
 
-log(`starting router`, { root: ROOT, home: HOME_DIR });
+log(`starting router`, { root: ROOT, home: HOME_DIR, larkProfile: cfg.larkProfile || undefined, larkAppId: cfg.larkAppId || undefined });
 if (cfg.idleStopMs > 0) {
   setInterval(stopIdleSessions, Math.min(cfg.idleStopMs, 60_000)).unref?.();
 }
@@ -111,6 +123,7 @@ startEventConsumer();
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+process.on('exit', releaseLarkBotLock);
 
 function loadDotEnv(file) {
   if (!fs.existsSync(file)) return;
@@ -246,8 +259,98 @@ function run(cmd, args, opts = {}) {
   return result.stdout;
 }
 
+function validateExplicitLarkBotConfig() {
+  if (cfg.larkProfile && cfg.larkAppId) return;
+  throw new Error([
+    'Explicit Feishu bot binding is required.',
+    'Set FTB_LARK_PROFILE to a lark-cli profile name and FTB_LARK_APP_ID to the Feishu/Lark app id.',
+    'Refusing to use the active lark-cli bot implicitly.',
+  ].join(' '));
+}
+
+function acquireLarkBotLock() {
+  const identity = resolveRuntimeLarkBotIdentity();
+  const lockDir = path.join(os.homedir(), '.feishu-agent-router', 'locks');
+  const lockPath = path.join(lockDir, `lark-bot-${safeLarkBotLockKey(identity.key)}.lock`);
+  fs.mkdirSync(lockDir, { recursive: true });
+
+  const payload = {
+    pid: process.pid,
+    instanceName: process.env.FTB_INSTANCE_NAME || '',
+    envPath: ENV_PATH,
+    home: HOME_DIR,
+    larkAs: cfg.larkAs,
+    larkProfile: identity.profile,
+    larkAppId: identity.appId,
+    key: identity.key,
+    startedAt: now(),
+  };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fd, `${JSON.stringify(payload, null, 2)}\n`);
+      fs.closeSync(fd);
+      return { path: lockPath, payload };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const existing = readJson(lockPath, {});
+      if (!existing.pid || !isPidAlive(existing.pid)) {
+        fs.rmSync(lockPath, { force: true });
+        continue;
+      }
+      throw new Error([
+        `Feishu bot is already bridged by another router process: ${identity.key}`,
+        `existing pid: ${existing.pid}`,
+        `existing instance: ${existing.instanceName || '(default)'}`,
+        `existing env: ${existing.envPath || '(unknown)'}`,
+        'Stop that router before starting another bridge for the same bot.',
+      ].join('\n'));
+    }
+  }
+
+  throw new Error(`Could not acquire Feishu bot lock: ${lockPath}`);
+}
+
+function resolveRuntimeLarkBotIdentity() {
+  if (cfg.larkAppId) {
+    return resolveLarkBotIdentity({ profile: cfg.larkProfile, appId: cfg.larkAppId });
+  }
+
+  const result = spawnSync('lark-cli', ['profile', 'list'], {
+    encoding: 'utf8',
+    cwd: ROOT,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const profiles = result.status === 0 ? parseLarkProfileList(result.stdout) : [];
+  return resolveLarkBotIdentity({ profiles, profile: cfg.larkProfile });
+}
+
+function releaseLarkBotLock() {
+  if (!larkBotLock?.path) return;
+  try {
+    const existing = readJson(larkBotLock.path, {});
+    if (existing.pid === process.pid) fs.rmSync(larkBotLock.path, { force: true });
+  } catch {}
+}
+
+function isPidAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function larkCliArgs(args) {
+  return buildLarkCliArgs(args, { profile: cfg.larkProfile });
+}
+
 function startEventConsumer() {
-  const args = [
+  const args = larkCliArgs([
     'event',
     'consume',
     'im.message.receive_v1',
@@ -255,7 +358,7 @@ function startEventConsumer() {
     cfg.larkAs,
     '--jq',
     '{event_id,message_id,id,chat_id,chat_type,sender_id,message_type,content,create_time,timestamp,thread_id}',
-  ];
+  ]);
   log(`spawning lark event consumer`, { args: args.join(' ') });
   const child = spawn('lark-cli', args, {
     cwd: ROOT,
@@ -303,11 +406,16 @@ async function handleEvent(event) {
   state.seen = state.seen.slice(-1000);
   writeJson(SEEN_PATH, state.seen);
 
-  if (!isAllowed(event)) {
+  const policy = evaluateAllowlist(event, cfg);
+  if (!policy.allowed) {
     log(`ignored event by policy`, {
       messageId,
+      reason: policy.reason,
+      field: policy.field,
+      configuredCount: policy.configuredCount,
       sender: shortId(event.sender_id),
       chat: shortId(event.chat_id),
+      remediation: policy.remediation,
     });
     return;
   }
@@ -346,12 +454,6 @@ async function handleEvent(event) {
     normalized,
     saveInbox: shouldSaveInbox(normalized),
   });
-}
-
-function isAllowed(event) {
-  if (cfg.allowedSenders.length && !cfg.allowedSenders.includes(event.sender_id)) return false;
-  if (cfg.allowedChats.length && !cfg.allowedChats.includes(event.chat_id)) return false;
-  return true;
 }
 
 function isAdmin(event) {
@@ -1166,6 +1268,7 @@ function createInboxEntry(event, normalized) {
   const entry = createInboxEntryLike(event, {
     inboxRoot: INBOX_DIR,
     larkAs: cfg.larkAs,
+    larkProfile: cfg.larkProfile,
     download: true,
   });
   const effective = normalized || entry.normalized;
@@ -1179,7 +1282,7 @@ function createInboxEntry(event, normalized) {
     for (const type of genericResourceTypes(effective.messageType)) {
       const result = spawnSync(
         'lark-cli',
-        ['im', '+messages-resources-download', '--as', cfg.larkAs, '--message-id', effective.messageId, '--type', type],
+        larkCliArgs(['im', '+messages-resources-download', '--as', cfg.larkAs, '--message-id', effective.messageId, '--type', type]),
         { cwd: entry.attachmentsDir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
       );
       const record = { type, stdout: result.stdout.trim(), stderr: result.stderr.trim(), status: result.status };
@@ -1220,7 +1323,7 @@ async function maybeReactPhase2(event, content, response) {
 
 function createReaction(messageId, emojiType, phase) {
   if (!messageId || !emojiType) return;
-  const args = buildReactionCreateArgv({ messageId, emojiType, larkAs: cfg.larkAs });
+  const args = buildReactionCreateArgv({ messageId, emojiType, larkAs: cfg.larkAs, larkProfile: cfg.larkProfile });
   const result = spawnSync('lark-cli', args, {
     encoding: 'utf8',
     cwd: ROOT,
@@ -1359,7 +1462,7 @@ async function reply(messageId, text) {
 function sendTextReply(messageId, text) {
   return spawnSync(
     'lark-cli',
-    ['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--text', text],
+    larkCliArgs(['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--text', text]),
     { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
   );
 }
@@ -1367,7 +1470,7 @@ function sendTextReply(messageId, text) {
 function sendReplyPayload(messageId, payload) {
   const result = spawnSync(
     'lark-cli',
-    ['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--msg-type', payload.msg_type, '--content', payload.content],
+    larkCliArgs(['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--msg-type', payload.msg_type, '--content', payload.content]),
     { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
   );
   return {
@@ -1382,7 +1485,7 @@ function sendReplyPayload(messageId, payload) {
 function patchMessagePayload(messageId, payload) {
   const result = spawnSync(
     'lark-cli',
-    ['api', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, '--as', cfg.larkAs, '--data', JSON.stringify({ content: payload.content })],
+    larkCliArgs(['api', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, '--as', cfg.larkAs, '--data', JSON.stringify({ content: payload.content })]),
     { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
   );
   return {
@@ -1396,7 +1499,7 @@ function patchMessagePayload(messageId, payload) {
 function deleteMessage(messageId) {
   const result = spawnSync(
     'lark-cli',
-    ['im', 'messages', 'delete', '--as', cfg.larkAs, '--params', JSON.stringify({ message_id: messageId })],
+    larkCliArgs(['im', 'messages', 'delete', '--as', cfg.larkAs, '--params', JSON.stringify({ message_id: messageId })]),
     { encoding: 'utf8', cwd: ROOT, maxBuffer: 4 * 1024 * 1024 },
   );
   if (result.status !== 0) {

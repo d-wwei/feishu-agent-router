@@ -20,7 +20,51 @@ npm run doctor
 npm start
 ```
 
-The router uses the existing local `lark-cli` app/bot configuration. No Feishu app secret is stored in this repo.
+The router uses an explicit local `lark-cli` profile for the Feishu bot/app. No
+Feishu app secret is stored in this repo.
+
+Create one `lark-cli` profile per Feishu bot/app:
+
+```bash
+printf '%s' "$FEISHU_APP_SECRET" \
+  | lark-cli profile add --name sales-bot --app-id cli_xxx --app-secret-stdin
+```
+
+Then pin the router env to that profile:
+
+```text
+FTB_LARK_AS=bot
+FTB_LARK_PROFILE=sales-bot
+FTB_LARK_APP_ID=cli_xxx
+```
+
+The router takes a global lock per `FTB_LARK_APP_ID` at startup. A second router
+for the same Feishu bot/app fails fast instead of consuming the same event stream
+from two local processes.
+
+`FTB_ALLOWED_SENDERS` must contain the `sender_id` from
+`im.message.receive_v1`. This value is a Feishu `open_id`, and `open_id` is
+app-scoped: the same human user can have a different `open_id` after you switch
+to a new bot/app. After changing bots, recapture the IDs before expecting the
+new bot to reply:
+
+```bash
+farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales \
+  allowlist-capture --timeout 120s
+```
+
+`allowlist-capture` prints full `sender_id` and `chat_id` only to local stdout;
+the router log keeps policy blocks scoped to redacted IDs and remediation text.
+If you run raw `lark-cli event consume` from an agent subprocess, keep stdin open
+or it may exit on EOF:
+
+```bash
+lark-cli --profile sales-bot event consume im.message.receive_v1 \
+  --as bot \
+  --jq '{message_id,chat_id,chat_type,sender_id,content}' \
+  --timeout 120s \
+  < <(tail -f /dev/null)
+```
 
 For real daily use, install it as a user launchd service:
 
@@ -41,15 +85,17 @@ farctl status
 farctl logs
 farctl logs -f
 farctl logs err
+farctl allowlist-capture --timeout 120s
 farctl uninstall
 ```
 
 Multiple bot instances can run side-by-side by giving each one its own
-instance name, env file, and runtime home:
+Feishu app/profile, instance name, env file, and runtime home:
 
 ```bash
 cp .env .env.sales
-# edit .env.sales: set FTB_LARK_AS, FTB_ALLOWED_SENDERS/CHATS, etc.
+# edit .env.sales: set FTB_LARK_PROFILE, FTB_LARK_APP_ID,
+# FTB_ALLOWED_SENDERS/CHATS, etc.
 farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales install
 farctl --name sales status
 farctl --name sales logs -f
@@ -58,7 +104,8 @@ farctl --name sales uninstall
 
 The default instance keeps the legacy service label `com.feishu-agent-router`.
 Named instances use labels such as `com.feishu-agent-router.sales`, so installing
-one will not overwrite another.
+one will not overwrite another. Instance names do not create new Feishu bots by
+themselves; `FTB_LARK_PROFILE` and `FTB_LARK_APP_ID` select the bot identity.
 
 The launchd plist is installed to:
 

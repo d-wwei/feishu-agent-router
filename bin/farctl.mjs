@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildLarkCliArgs } from '../lib/lark-cli.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -32,6 +33,13 @@ const command = cli.command || 'help';
 const rest = cli.args;
 
 try {
+  await main();
+} catch (error) {
+  console.error(`farctl: ${error.message || String(error)}`);
+  process.exit(1);
+}
+
+async function main() {
   switch (command) {
     case 'install':
       install();
@@ -54,6 +62,9 @@ try {
     case 'logs':
       logs(rest);
       break;
+    case 'allowlist-capture':
+      await allowlistCapture(rest);
+      break;
     case 'doctor':
       passthroughDoctor();
       break;
@@ -68,9 +79,6 @@ try {
     default:
       throw new Error(`Unknown command: ${command}`);
   }
-} catch (error) {
-  console.error(`farctl: ${error.message || String(error)}`);
-  process.exit(1);
 }
 
 function install() {
@@ -149,12 +157,82 @@ function logs(args) {
   }
 }
 
+async function allowlistCapture(args) {
+  const timeout = parseTimeoutArg(args, '120s');
+  const dryRun = args.includes('--dry-run');
+  const larkAs = env('FTB_LARK_AS', 'bot');
+  const larkProfile = env('FTB_LARK_PROFILE', '');
+  const larkAppId = env('FTB_LARK_APP_ID', '');
+  if (!larkProfile || !larkAppId) {
+    throw new Error(`Env ${ENV_PATH} must set FTB_LARK_PROFILE and FTB_LARK_APP_ID before allowlist capture.`);
+  }
+
+  const captureArgs = buildLarkCliArgs([
+    'event',
+    'consume',
+    'im.message.receive_v1',
+    '--as',
+    larkAs,
+    '--jq',
+    '{message_id,chat_id,chat_type,sender_id,content}',
+    '--timeout',
+    timeout,
+    '--quiet',
+  ], { profile: larkProfile });
+
+  console.log(`Capturing full Feishu sender_id/chat_id for ${LABEL}`);
+  console.log(`profile: ${larkProfile}`);
+  console.log(`app_id: ${larkAppId}`);
+  console.log('Send one message to the bot now. Full IDs are printed only to this local stdout.');
+  console.log('');
+
+  if (dryRun) {
+    console.log([`lark-cli`, ...captureArgs].join(' '));
+    console.log('stdin: kept open by farctl to avoid EOF in agent subprocesses');
+    return;
+  }
+
+  const child = spawn('lark-cli', captureArgs, {
+    cwd: ROOT,
+    stdio: ['pipe', 'inherit', 'inherit'],
+  });
+  child.stdin.write('\n');
+  const killTimer = setTimeout(() => child.kill('SIGTERM'), durationMs(timeout) + 5_000);
+  killTimer.unref?.();
+  const status = await new Promise((resolve) => {
+    child.on('exit', (code, signal) => resolve({ code, signal }));
+  });
+  clearTimeout(killTimer);
+  if (status.code && status.code !== 0) {
+    throw new Error(`lark-cli event consume exited with code ${status.code}${status.signal ? ` signal ${status.signal}` : ''}`);
+  }
+}
+
 function passthroughDoctor() {
   const result = spawnSync(NODE, [path.join(ROOT, 'bin', 'doctor.mjs')], {
     cwd: ROOT,
     stdio: 'inherit',
   });
   process.exitCode = result.status || 0;
+}
+
+function parseTimeoutArg(args, fallback) {
+  const idx = args.indexOf('--timeout');
+  if (idx >= 0) return args[idx + 1] || fallback;
+  const inline = args.find((arg) => arg.startsWith('--timeout='));
+  if (inline) return inline.slice('--timeout='.length) || fallback;
+  return args.find((arg) => /^\d+[smh]?$/.test(arg)) || fallback;
+}
+
+function durationMs(value) {
+  const match = String(value || '').trim().match(/^(\d+)(ms|s|m|h)?$/);
+  if (!match) return 120_000;
+  const amount = Number(match[1]);
+  const unit = match[2] || 's';
+  if (unit === 'ms') return amount;
+  if (unit === 'm') return amount * 60_000;
+  if (unit === 'h') return amount * 3_600_000;
+  return amount * 1_000;
 }
 
 function bootstrap() {
@@ -313,6 +391,7 @@ Commands:
   restart      Restart service
   status       Show launchd status
   logs [kind]  Show logs; kind: router|out|err; add -f to follow
+  allowlist-capture  Print full sender_id/chat_id from the next bot event
   doctor       Run environment checks
   plist        Print generated launchd plist
 
@@ -324,6 +403,7 @@ Options:
 Examples:
   farctl install
   farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales install
+  farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales allowlist-capture --timeout 120s
   farctl --name ops status
 `);
 }

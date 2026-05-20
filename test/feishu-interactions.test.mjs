@@ -71,6 +71,15 @@ test('reaction argv builders target lark-cli reaction APIs', () => {
   ]);
 });
 
+test('reaction argv builders can pin a lark profile', () => {
+  assert.deepEqual(buildReactionCreateArgv({
+    messageId: 'om_1',
+    emojiType: 'THINKING',
+    larkAs: 'bot',
+    larkProfile: 'sales-bot',
+  }).slice(0, 3), ['--profile', 'sales-bot', 'im']);
+});
+
 test('streaming card argv builders send, patch, and delete cards', () => {
   const sendArgv = buildStreamingCardSendArgv({
     chatId: 'oc_1',

@@ -118,6 +118,16 @@ test('buildLarkCliResourceDownloadArgs includes file-key without exposing secret
   );
 });
 
+test('buildLarkCliResourceDownloadArgs can pin a lark profile', () => {
+  assert.deepEqual(
+    buildLarkCliResourceDownloadArgs(
+      { messageId: 'om1', fileKey: 'img1', resourceType: 'image' },
+      { as: 'bot', profile: 'sales-bot' },
+    ),
+    ['--profile', 'sales-bot', 'im', '+messages-resources-download', '--as', 'bot', '--message-id', 'om1', '--file-key', 'img1', '--type', 'image'],
+  );
+});
+
 test('createInboxEntryLike writes normalized materials and manifest', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-ingest-'));
   const entry = createInboxEntryLike(

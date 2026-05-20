@@ -38,12 +38,15 @@ function main() {
 
   if (command === 'print-env') {
     rejectUnexpectedRest(command);
+    requireExplicitBotInfo();
     process.stdout.write(renderEnv({ routerRoot, instanceName, envPath, homePath, baseCwd }));
     return;
   }
 
   if (command === 'init') {
     rejectUnexpectedRest(command);
+    requireExplicitBotInfo();
+    maybeCreateLarkProfile();
     writeEnvFile({ routerRoot, instanceName, envPath, homePath, baseCwd, force: Boolean(args.options.force) });
     console.log(`env: ${envPath}`);
     console.log(`home: ${homePath}`);
@@ -53,7 +56,12 @@ function main() {
   const farctlCommand = normalizeCommand(command);
   const shouldEnsureEnv = ['install', 'start', 'restart', 'doctor', 'plist'].includes(farctlCommand);
   if (shouldEnsureEnv && !fs.existsSync(envPath)) {
+    requireExplicitBotInfo();
+    maybeCreateLarkProfile();
     writeEnvFile({ routerRoot, instanceName, envPath, homePath, baseCwd, force: false });
+  }
+  if (['install', 'start', 'restart', 'allowlist-capture', 'doctor', 'plist'].includes(farctlCommand)) {
+    requireEnvHasExplicitBotInfo(envPath);
   }
 
   const farctlArgs = [];
@@ -102,9 +110,13 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
   const workdir = path.resolve(args.options.workdir || baseCwd);
   const allowedSenders = optionOrEnv('allowedSenders', 'FTB_ALLOWED_SENDERS', '');
   const adminUsers = optionOrEnv('adminUsers', 'FTB_ADMIN_USERS', allowedSenders);
+  const larkProfile = optionOrEnv('larkProfile', 'FTB_LARK_PROFILE', '');
+  const larkAppId = optionOrEnv('botAppId', 'FTB_LARK_APP_ID', '');
   const values = {
     FTB_INSTANCE_NAME: instanceName,
     FTB_LARK_AS: optionOrEnv('larkAs', 'FTB_LARK_AS', 'bot'),
+    FTB_LARK_PROFILE: larkProfile,
+    FTB_LARK_APP_ID: larkAppId,
     FTB_ALLOWED_SENDERS: allowedSenders,
     FTB_ALLOWED_CHATS: optionOrEnv('allowedChats', 'FTB_ALLOWED_CHATS', ''),
     FTB_ADMIN_USERS: adminUsers,
@@ -173,6 +185,82 @@ function optionOrEnv(optionKey, envKey, fallback) {
   return fallback;
 }
 
+function requireExplicitBotInfo() {
+  const profile = optionOrEnv('larkProfile', 'FTB_LARK_PROFILE', '');
+  const appId = optionOrEnv('botAppId', 'FTB_LARK_APP_ID', '');
+  if (!profile || !appId) {
+    const instance = args.options.name || '<instance>';
+    const workdir = args.options.workdir || '$PWD';
+    throw new Error([
+      'Explicit Feishu bot information is required for a bridge instance.',
+      'Pass --lark-profile <profile-name> and --bot-app-id <cli_xxx>.',
+      'Create the profile first with lark-cli profile add, or pass --create-lark-profile with --bot-app-secret-stdin.',
+      'Example:',
+      `node "$SKILL_DIR/scripts/bridge-instance.mjs" init --name ${instance} --lark-profile <profile-name> --bot-app-id <cli_xxx> --allowed-senders <sender_open_id> --admin-users <sender_open_id> --workdir "${workdir}"`,
+    ].join(' '));
+  }
+}
+
+function requireEnvHasExplicitBotInfo(envPath) {
+  if (!fs.existsSync(envPath)) return;
+  const env = readDotEnv(envPath);
+  if (!env.FTB_LARK_PROFILE || !env.FTB_LARK_APP_ID) {
+    throw new Error([
+      `Env file lacks explicit bot binding: ${envPath}`,
+      'Refusing to use the active lark-cli bot implicitly.',
+      'Regenerate it with init --force --lark-profile <profile-name> --bot-app-id <cli_xxx>.',
+    ].join(' '));
+  }
+}
+
+function maybeCreateLarkProfile() {
+  if (!args.options.createLarkProfile) return;
+  const profile = optionOrEnv('larkProfile', 'FTB_LARK_PROFILE', '');
+  const appId = optionOrEnv('botAppId', 'FTB_LARK_APP_ID', '');
+  const secret = readBotAppSecret();
+  if (!secret) throw new Error('Creating a lark profile requires --bot-app-secret-stdin or --bot-app-secret-env <NAME>.');
+  const result = spawnSync('lark-cli', ['profile', 'add', '--name', profile, '--app-id', appId, '--app-secret-stdin'], {
+    input: secret,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `lark-cli profile add failed for ${profile}`);
+  }
+  console.log(`Created lark-cli profile: ${profile}`);
+}
+
+function readBotAppSecret() {
+  if (args.options.botAppSecretEnv) {
+    return process.env[args.options.botAppSecretEnv] || '';
+  }
+  if (args.options.botAppSecretStdin) {
+    return fs.readFileSync(0, 'utf8').trim();
+  }
+  return '';
+}
+
+function readDotEnv(file) {
+  const result = {};
+  if (!fs.existsSync(file)) return result;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value.replace(/\\"/g, '"');
+  }
+  return result;
+}
+
 function dotenvValue(value) {
   const text = String(value ?? '');
   if (/[\n\r]/.test(text)) throw new Error('Env values cannot contain newlines.');
@@ -191,7 +279,7 @@ function normalizeCommand(command) {
     remove: 'uninstall',
   };
   const normalized = aliases[command] || command;
-  const allowed = new Set(['install', 'uninstall', 'start', 'stop', 'restart', 'status', 'logs', 'doctor', 'plist']);
+  const allowed = new Set(['install', 'uninstall', 'start', 'stop', 'restart', 'status', 'logs', 'allowlist-capture', 'doctor', 'plist']);
   if (!allowed.has(normalized)) {
     throw new Error(`Unknown command: ${command}. Run help for usage.`);
   }
@@ -229,7 +317,7 @@ function parseArgs(argv) {
     const rawKey = eqIndex >= 0 ? rawOption.slice(0, eqIndex) : rawOption;
     const inlineValue = eqIndex >= 0 ? rawOption.slice(eqIndex + 1) : undefined;
     const key = optionKey(rawKey);
-    if (key === 'force' || key === 'dryRun') {
+    if (key === 'force' || key === 'dryRun' || key === 'createLarkProfile' || key === 'botAppSecretStdin') {
       options[key] = true;
       continue;
     }
@@ -260,6 +348,11 @@ function optionKey(raw) {
     dir: 'cwd',
     'router-root': 'routerRoot',
     'lark-as': 'larkAs',
+    'lark-profile': 'larkProfile',
+    'bot-app-id': 'botAppId',
+    'create-lark-profile': 'createLarkProfile',
+    'bot-app-secret-stdin': 'botAppSecretStdin',
+    'bot-app-secret-env': 'botAppSecretEnv',
     'allowed-senders': 'allowedSenders',
     'allowed-chats': 'allowedChats',
     'admin-users': 'adminUsers',
@@ -334,6 +427,8 @@ Commands:
   restart       Restart service
   status        Show launchd status
   logs          Show logs; pass router|out|err, a line count, or -f
+  allowlist-capture
+               Print full sender_id/chat_id from the next bot event
   doctor        Run router environment checks
   plist         Print generated launchd plist
   uninstall     Stop service and remove launchd plist
@@ -344,6 +439,11 @@ Core options:
   --home DIR                  Runtime state path; default: ~/.feishu-agent-router-<instance>
   --cwd DIR                   Directory for default env placement
   --router-root DIR           feishu-agent-router repository path
+  --lark-profile NAME         Required lark-cli profile for this Feishu bot
+  --bot-app-id APP_ID         Required Feishu/Lark app id for uniqueness locks
+  --create-lark-profile       Run lark-cli profile add before writing env
+  --bot-app-secret-stdin      Read app secret from stdin for profile creation
+  --bot-app-secret-env NAME   Read app secret from an environment variable
   --allowed-senders IDS       Comma-separated Feishu user IDs
   --allowed-chats IDS         Comma-separated Feishu chat IDs
   --admin-users IDS           Comma-separated admin user IDs
@@ -354,8 +454,9 @@ Core options:
   --dry-run                   Print farctl invocation without running it
 
 Examples:
-  bridge-instance.mjs init --name sales --allowed-senders ou_xxx --admin-users ou_xxx
+  bridge-instance.mjs init --name sales --lark-profile sales-bot --bot-app-id cli_xxx --allowed-senders ou_xxx --admin-users ou_xxx
   bridge-instance.mjs install --name sales
+  bridge-instance.mjs allowlist-capture --name sales --timeout 120s
   bridge-instance.mjs logs --name sales -f
 `);
 }
