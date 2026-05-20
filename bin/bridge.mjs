@@ -818,9 +818,10 @@ function hasAssistantOutput(before, after) {
 }
 
 function assistantOutput(before, after) {
-  const diff = diffText(before, after);
-  const lines = diff.split('\n');
-  const start = lines.findIndex((line) => line.trim().startsWith('• '));
+  const lines = String(after || '').split('\n');
+  const promptStart = findLastIndex(lines, (line) => line.trim().startsWith('› 飞书远程消息'));
+  const searchFrom = promptStart >= 0 ? promptStart + 1 : 0;
+  const start = lines.findIndex((line, index) => index >= searchFrom && line.trim().startsWith('• '));
   if (start < 0) return '';
   const kept = [];
   for (const line of lines.slice(start)) {
@@ -828,9 +829,16 @@ function assistantOutput(before, after) {
     if (trimmed.startsWith('› ')) break;
     if (trimmed.includes('esc to interrupt')) continue;
     if (trimmed.includes('tab to queue message')) continue;
-    kept.push(line);
+    kept.push(kept.length === 0 ? line.replace(/^(\s*)•\s?/, '$1') : line);
   }
   return kept.join('\n').trim();
+}
+
+function findLastIndex(items, predicate) {
+  for (let index = items.length - 1; index >= 0; index--) {
+    if (predicate(items[index], index)) return index;
+  }
+  return -1;
 }
 
 function diffText(before, after) {
