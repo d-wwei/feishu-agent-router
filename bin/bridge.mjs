@@ -76,7 +76,7 @@ const cfg = {
   codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', true),
   feishuRichReplies: boolEnv('FTB_FEISHU_RICH_REPLIES', true),
   feishuReactions: boolEnv('FTB_FEISHU_REACTIONS', true),
-  feishuStreaming: boolEnv('FTB_FEISHU_STREAMING', true),
+  feishuStreaming: boolEnv('FTB_FEISHU_STREAMING', false),
   feishuStreamPatchMs: intEnv('FTB_FEISHU_STREAM_PATCH_MS', 2_000),
 };
 

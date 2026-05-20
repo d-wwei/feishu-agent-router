@@ -201,7 +201,7 @@ Feishu UX migration:
 - Replies use Feishu post messages for normal markdown and interactive cards for code blocks/tables
 - Message reactions are added as best-effort phase feedback when the bot has reaction permission
 - Permission cards can be rendered, but button callback handling is not wired until the active `lark-cli` event catalog exposes card action events; text fallback commands remain the safe path
-- Streaming replies are sent as an initial interactive card and patched in place; if card send/patch fails, the router falls back to the normal final reply
+- Streaming replies are available via `FTB_FEISHU_STREAMING=true`; the default is off because short replies are faster as a single final message
 
 ## Backends
 
