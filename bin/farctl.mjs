@@ -8,21 +8,28 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
 const HOME = os.homedir();
-const LABEL = 'com.feishu-agent-router';
+const cli = parseCli(process.argv.slice(2));
+const INSTANCE_NAME = sanitizeInstanceName(cli.options.name || process.env.FTB_INSTANCE_NAME || '');
+const LABEL = INSTANCE_NAME ? `com.feishu-agent-router.${INSTANCE_NAME}` : 'com.feishu-agent-router';
 const PLIST_PATH = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
-const ENV_PATH = path.join(ROOT, '.env');
+const ENV_PATH = path.resolve(cli.options.env || process.env.FTB_ENV_PATH || path.join(ROOT, '.env'));
 
 loadDotEnv(ENV_PATH);
 
-const FTB_HOME = env('FTB_HOME', path.join(HOME, '.feishu-agent-router'));
+const FTB_HOME = cli.options.home
+  ? path.resolve(cli.options.home)
+  : env(
+    'FTB_HOME',
+    INSTANCE_NAME ? path.join(HOME, `.feishu-agent-router-${INSTANCE_NAME}`) : path.join(HOME, '.feishu-agent-router'),
+  );
 const LOG_DIR = path.join(FTB_HOME, 'logs');
 const NODE = process.execPath;
 const UID = process.getuid?.() ?? Number(run('id', ['-u']).trim());
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
-const command = process.argv[2] || 'help';
-const rest = process.argv.slice(3);
+const command = cli.command || 'help';
+const rest = cli.args;
 
 try {
   switch (command) {
@@ -112,6 +119,7 @@ function status() {
   const result = spawnSync('launchctl', ['print', domainTarget()], { encoding: 'utf8' });
   if (result.status !== 0) {
     console.log(`Service ${LABEL}: not loaded`);
+    console.log(`plist: ${PLIST_PATH}`);
     return;
   }
   const pid = result.stdout.match(/\bpid = (\d+)/)?.[1];
@@ -120,6 +128,7 @@ function status() {
   console.log(`state: ${state || 'unknown'}`);
   console.log(`pid: ${pid || '-'}`);
   console.log(`plist: ${PLIST_PATH}`);
+  console.log(`env: ${ENV_PATH}`);
   console.log(`home: ${FTB_HOME}`);
 }
 
@@ -181,6 +190,8 @@ function renderPlist() {
     ].join(':'),
     HOME,
     FTB_HOME,
+    FTB_ENV_PATH: ENV_PATH,
+    ...(INSTANCE_NAME ? { FTB_INSTANCE_NAME: INSTANCE_NAME } : {}),
   };
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -233,6 +244,44 @@ function loadDotEnv(file) {
   }
 }
 
+function parseCli(argv) {
+  const options = {};
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === '--name') {
+      options.name = argv[++i] || '';
+    } else if (token.startsWith('--name=')) {
+      options.name = token.slice('--name='.length);
+    } else if (token === '--env') {
+      options.env = argv[++i] || '';
+    } else if (token.startsWith('--env=')) {
+      options.env = token.slice('--env='.length);
+    } else if (token === '--home') {
+      options.home = argv[++i] || '';
+    } else if (token.startsWith('--home=')) {
+      options.home = token.slice('--home='.length);
+    } else {
+      positional.push(token);
+    }
+  }
+  return {
+    command: positional[0],
+    args: positional.slice(1),
+    options,
+  };
+}
+
+function sanitizeInstanceName(value) {
+  const name = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!name || name === 'default') return '';
+  return name.slice(0, 48);
+}
+
 function env(name, fallback) {
   const value = process.env[name];
   return value && value.trim() ? value.trim() : fallback;
@@ -254,7 +303,7 @@ function xml(value) {
 }
 
 function help() {
-  console.log(`Usage: farctl <command>
+  console.log(`Usage: farctl [--name <instance>] [--env <file>] <command>
 
 Commands:
   install      Install launchd service and start it
@@ -266,5 +315,15 @@ Commands:
   logs [kind]  Show logs; kind: router|out|err; add -f to follow
   doctor       Run environment checks
   plist        Print generated launchd plist
+
+Options:
+  --name NAME  Instance name. Default uses the legacy com.feishu-agent-router service.
+  --env FILE   Env file for this instance. Default: ${path.join(ROOT, '.env')}
+  --home DIR   Runtime state directory for this instance.
+
+Examples:
+  farctl install
+  farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales install
+  farctl --name ops status
 `);
 }

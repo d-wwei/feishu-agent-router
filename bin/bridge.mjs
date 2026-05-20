@@ -21,10 +21,21 @@ import {
   pickPhase1Emoji,
   pickPhase2Emojis,
 } from '../lib/feishu-interactions.mjs';
+import {
+  buildCodexCliConfigArgs,
+  buildCodexThreadParams,
+  buildCodexTurnParams,
+} from '../lib/codex-config.mjs';
+import {
+  ensureAutoGroupSession,
+  shouldIgnorePlainGroupMessage,
+} from '../lib/session-routing.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
-const ENV_PATH = path.join(ROOT, '.env');
+const ENV_PATH = process.env.FTB_ENV_PATH
+  ? path.resolve(process.env.FTB_ENV_PATH)
+  : path.join(ROOT, '.env');
 
 loadDotEnv(ENV_PATH);
 
@@ -58,6 +69,8 @@ const cfg = {
     env('FTB_CODEX_CMD', 'codex --no-alt-screen --sandbox danger-full-access -a never'),
   ),
   groupRequireCommand: boolEnv('FTB_GROUP_REQUIRE_COMMAND', true),
+  autoCreateGroupSessions: boolEnv('FTB_AUTO_CREATE_GROUP_SESSIONS', false),
+  autoGroupSessionPrefix: env('FTB_AUTO_GROUP_SESSION_PREFIX', 'group'),
   maxWaitMs: intEnv('FTB_MAX_WAIT_MS', 90_000),
   stableMs: intEnv('FTB_STABLE_MS', 3_500),
   pollMs: intEnv('FTB_POLL_MS', 1_000),
@@ -69,7 +82,10 @@ const cfg = {
   codexAppServerPort: optionalIntEnv('FTB_CODEX_APP_SERVER_PORT'),
   codexRequestTimeoutMs: intEnv('FTB_CODEX_REQUEST_TIMEOUT_MS', 120_000),
   codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
+  codexProfile: env('FTB_CODEX_PROFILE', ''),
   codexModel: env('FTB_CODEX_MODEL', ''),
+  codexModelProvider: env('FTB_CODEX_MODEL_PROVIDER', ''),
+  codexServiceTier: env('FTB_CODEX_SERVICE_TIER', ''),
   codexReasoningEffort: env('FTB_CODEX_REASONING_EFFORT', 'medium'),
   codexSandbox: env('FTB_CODEX_SANDBOX', 'danger-full-access'),
   codexApprovalPolicy: env('FTB_CODEX_APPROVAL_POLICY', 'never'),
@@ -111,7 +127,9 @@ function loadDotEnv(file) {
     ) {
       value = value.slice(1, -1);
     }
-    process.env[key] = value.replace(/\\"/g, '"');
+    if (process.env[key] === undefined) {
+      process.env[key] = value.replace(/\\"/g, '"');
+    }
   }
 }
 
@@ -319,7 +337,7 @@ async function handleEvent(event) {
     return;
   }
 
-  if (shouldIgnorePlainMessage(event)) {
+  if (shouldIgnorePlainGroupMessage(event, cfg)) {
     log(`ignored plain group message`, { messageId, chat: shortId(event.chat_id) });
     return;
   }
@@ -343,10 +361,6 @@ function isAdmin(event) {
 
 function isCommand(content) {
   return content.startsWith('/');
-}
-
-function shouldIgnorePlainMessage(event) {
-  return cfg.groupRequireCommand && event.chat_type === 'group';
 }
 
 function shouldSaveInbox(normalized) {
@@ -610,7 +624,20 @@ function resolveSessionName(event) {
   const chatRoute = event.chat_id && state.routes.chats[event.chat_id]?.defaultSession;
   const userRoute = event.sender_id && state.routes.users[event.sender_id]?.defaultSession;
   const userCurrent = event.sender_id && state.userContext[event.sender_id]?.currentSession;
-  return threadRoute || userCurrent || chatRoute || userRoute || cfg.defaultSession;
+  if (threadRoute || userCurrent || chatRoute || userRoute) {
+    return threadRoute || userCurrent || chatRoute || userRoute;
+  }
+
+  const autoGroup = ensureAutoGroupSession(state, event, cfg, { now: now() });
+  if (autoGroup?.changed) {
+    writeJson(SESSIONS_PATH, state.sessions);
+    writeJson(ROUTES_PATH, state.routes);
+    log('auto-created group session', {
+      sessionName: autoGroup.sessionName,
+      chat: shortId(event.chat_id),
+    });
+  }
+  return autoGroup?.sessionName || cfg.defaultSession;
 }
 
 function getSession(name) {
@@ -629,10 +656,7 @@ async function ensureCodexThread(name) {
       await codexAppServer.threadResume({
         threadId: session.threadId,
         cwd: session.cwd || cfg.defaultWorkdir,
-        approvalPolicy: cfg.codexApprovalPolicy,
-        sandbox: cfg.codexSandbox,
-        config: codexConfig(),
-        ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
+        ...buildCodexThreadParams(cfg),
       });
       return session.threadId;
     } catch (error) {
@@ -646,22 +670,11 @@ async function ensureCodexThread(name) {
 
   const result = await codexAppServer.threadStart({
     cwd: session.cwd || cfg.defaultWorkdir,
-    approvalPolicy: cfg.codexApprovalPolicy,
-    sandbox: cfg.codexSandbox,
-    config: codexConfig(),
-    ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
+    ...buildCodexThreadParams(cfg),
   });
   const threadId = result.thread.id;
   updateSessionFields(name, { threadId, updatedAt: now() });
   return threadId;
-}
-
-function codexConfig() {
-  return {
-    sandbox_workspace_write: {
-      network_access: Boolean(cfg.codexNetworkAccess),
-    },
-  };
 }
 
 class CodexAppServerClient {
@@ -688,8 +701,14 @@ class CodexAppServerClient {
     }
     this.port = cfg.codexAppServerPort || await allocatePort();
     const listenUrl = `ws://127.0.0.1:${this.port}`;
-    log('starting codex app-server', { listenUrl });
-    this.child = spawn(cfg.codexPath, ['app-server', '--listen', listenUrl], {
+    const args = ['app-server', '--listen', listenUrl, ...buildCodexCliConfigArgs(cfg)];
+    log('starting codex app-server', {
+      listenUrl,
+      profile: cfg.codexProfile || undefined,
+      model: cfg.codexModel || undefined,
+      modelProvider: cfg.codexModelProvider || undefined,
+    });
+    this.child = spawn(cfg.codexPath, args, {
       cwd: ROOT,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -939,8 +958,7 @@ const codexAppServerBackend = {
       input: [{ type: 'text', text, text_elements: [] }],
       cwd: getSession(name).cwd || cfg.defaultWorkdir,
       approvalPolicy: cfg.codexApprovalPolicy,
-      ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
-      ...(cfg.codexReasoningEffort ? { effort: cfg.codexReasoningEffort } : {}),
+      ...buildCodexTurnParams(cfg),
     }, opts);
     updateSessionFields(name, {
       state: 'running',
@@ -1068,13 +1086,13 @@ const tmuxBackend = {
   },
   async waitForOutput(name, before) {
     const start = Date.now();
-    let last = this.capture(name);
+    let last = await this.capture(name);
     let lastChangedAt = Date.now();
     let sawChange = false;
 
     while (Date.now() - start < cfg.maxWaitMs) {
       await sleep(cfg.pollMs);
-      const current = this.capture(name);
+      const current = await this.capture(name);
       if (current !== last) {
         last = current;
         lastChangedAt = Date.now();
@@ -1086,7 +1104,7 @@ const tmuxBackend = {
       }
     }
 
-    const current = this.capture(name);
+    const current = await this.capture(name);
     return {
       output: assistantOutput(before, current) || diffText(before, current),
       elapsedMs: Date.now() - start,

@@ -44,10 +44,27 @@ farctl logs err
 farctl uninstall
 ```
 
+Multiple bot instances can run side-by-side by giving each one its own
+instance name, env file, and runtime home:
+
+```bash
+cp .env .env.sales
+# edit .env.sales: set FTB_LARK_AS, FTB_ALLOWED_SENDERS/CHATS, etc.
+farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales install
+farctl --name sales status
+farctl --name sales logs -f
+farctl --name sales uninstall
+```
+
+The default instance keeps the legacy service label `com.feishu-agent-router`.
+Named instances use labels such as `com.feishu-agent-router.sales`, so installing
+one will not overwrite another.
+
 The launchd plist is installed to:
 
 ```text
 ~/Library/LaunchAgents/com.feishu-agent-router.plist
+~/Library/LaunchAgents/com.feishu-agent-router.<name>.plist
 ```
 
 Runtime logs are written to:
@@ -90,10 +107,16 @@ thread route
 -> current user session from /use
 -> chat route from /bind
 -> user route
+-> auto-created group session
 -> FTB_DEFAULT_SESSION
 ```
 
 A Feishu group can therefore map to one persistent local work context, while a different group can map to another session and another agent.
+
+When `FTB_AUTO_CREATE_GROUP_SESSIONS=true`, the first plain message received in
+a new group automatically creates a dedicated session and binds that group to
+it. Manual `/new` and `/bind` are still available when you want explicit names
+or non-default backend settings.
 
 ## Commands
 

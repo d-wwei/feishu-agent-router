@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Bridge"
+  short_description: "Manage Feishu bridge instances"
+  default_prompt: "Use $feishu-bridge to configure or inspect a Feishu-to-Codex bridge instance."
