@@ -727,6 +727,7 @@ async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
     const session = getSession(sessionName);
     if (session.backend !== 'codex-app-server' || session.fallback === false) throw error;
     log('codex app-server failed; falling back to tmux', { sessionName, error: error.message || String(error) });
+    updateSessionFields(sessionName, { threadId: null, state: 'stopped', updatedAt: now() });
     const result = await tmuxBackend.run(sessionName, prompt, opts);
     return {
       ...result,
