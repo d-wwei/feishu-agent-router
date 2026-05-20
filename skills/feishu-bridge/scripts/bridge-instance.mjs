@@ -132,7 +132,7 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_AGENT_CMD: optionOrEnv(
       'agentCmd',
       'FTB_AGENT_CMD',
-      `codex --no-alt-screen --cd ${workdir} --sandbox danger-full-access -a never`,
+      `codex --no-alt-screen --cd ${shellQuote(workdir)} --sandbox danger-full-access -a never`,
     ),
     FTB_CODEX_PATH: optionOrEnv('codexPath', 'FTB_CODEX_PATH', 'codex'),
     FTB_CODEX_APP_SERVER_PORT: optionOrEnv('codexAppServerPort', 'FTB_CODEX_APP_SERVER_PORT', ''),
@@ -183,6 +183,10 @@ function optionOrEnv(optionKey, envKey, fallback) {
   const envValue = process.env[envKey];
   if (envValue !== undefined && envValue !== '') return envValue;
   return fallback;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
 function requireExplicitBotInfo() {

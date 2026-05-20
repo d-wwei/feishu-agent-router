@@ -38,3 +38,24 @@ test('bridge-instance generated env pins lark profile and app id', () => {
   assert.match(result.stdout, /^FTB_LARK_PROFILE=sales-bot$/m);
   assert.match(result.stdout, /^FTB_LARK_APP_ID=cli_sales$/m);
 });
+
+test('bridge-instance quotes workdir in fallback agent command', () => {
+  const result = spawnSync(process.execPath, [
+    bridgeInstance,
+    'print-env',
+    '--name',
+    'sales',
+    '--lark-profile',
+    'sales-bot',
+    '--bot-app-id',
+    'cli_sales',
+    '--workdir',
+    '/tmp/path with spaces',
+  ], {
+    encoding: 'utf8',
+    cwd: root,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^FTB_AGENT_CMD="codex --no-alt-screen --cd '\/tmp\/path with spaces' --sandbox danger-full-access -a never"$/m);
+});

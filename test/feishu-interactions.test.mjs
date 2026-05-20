@@ -17,7 +17,11 @@ import {
 } from '../lib/feishu-interactions.mjs';
 
 test('pickPhase1Emoji returns contextual emoji or substantial fallback', () => {
-  assert.equal(pickPhase1Emoji('hi there'), 'WAVE');
+  assert.equal(pickPhase1Emoji('hi there'), null);
+  assert.equal(pickPhase1Emoji('你好'), null);
+  assert.equal(pickPhase1Emoji('bye bye'), null);
+  assert.equal(pickPhase1Emoji('再见'), null);
+  assert.equal(pickPhase1Emoji('你好，帮我检查一下'), 'OnIt');
   assert.equal(pickPhase1Emoji('麻烦帮我检查一下报错'), 'OnIt');
   assert.equal(pickPhase1Emoji('tiny'), null);
   assert.equal(pickPhase1Emoji('please take a look'), 'THINKING');

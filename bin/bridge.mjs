@@ -680,9 +680,24 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
   await maybeReactPhase1(event, content);
   const stream = createStreamingReplyController(event.message_id || event.id, content);
-  const result = await runSessionWithFallback(sessionName, backend, prompt, {
-    onDelta: (deltaText) => stream?.update(deltaText),
-  });
+  let result;
+  try {
+    result = await runSessionWithFallback(sessionName, backend, prompt, {
+      onDelta: (deltaText) => stream?.update(deltaText),
+    });
+  } catch (error) {
+    const message = error.message || String(error);
+    log('session turn failed', { sessionName, error: message });
+    const failureText = [
+      `投递到 ${sessionName} 失败。`,
+      '',
+      message,
+      '',
+      '桥接服务仍在运行；请稍后重试，或发 /status 查看 session 状态。',
+    ].join('\n');
+    if (!stream?.finish(failureText)) await reply(event.message_id || event.id, failureText);
+    return;
+  }
   const { output, elapsedMs, stable, backendName, fallbackReason } = result;
   log('session turn completed', { sessionName, backend: backendName, elapsedMs, stable, fallback: Boolean(fallbackReason) });
   const text = output.trim()
@@ -887,7 +902,10 @@ class CodexAppServerClient {
         const turn = this.turns.get(turnId);
         if (!turn) return;
         this.turns.delete(turnId);
-        reject(new Error('Timed out waiting for turn/completed'));
+        this.request('turn/interrupt', { threadId: params.threadId, turnId }).catch((error) => {
+          log('codex turn interrupt after timeout failed', { turnId, error: error.message || String(error) });
+        });
+        reject(new Error('Timed out waiting for turn/completed; interrupt requested'));
       }, cfg.codexRequestTimeoutMs);
     });
   }
@@ -1127,6 +1145,10 @@ const tmuxBackend = {
     }
     log(`creating tmux session`, { name, tmuxSession, cwd });
     run('tmux', ['new-session', '-d', '-s', tmuxSession, '-c', cwd, 'sh', '-lc', command]);
+    await sleep(750);
+    if (!hasTmuxSession(tmuxSession)) {
+      throw new Error(`tmux session ${tmuxSession} exited immediately after start; command=${command}`);
+    }
     updateSessionState(name, 'running');
   },
   async run(name, text) {
