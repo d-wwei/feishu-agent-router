@@ -38,6 +38,7 @@ import {
   resolveLarkBotIdentity,
   safeLarkBotLockKey,
 } from '../lib/lark-cli.mjs';
+import { isFeishuSelfSendReceipt } from '../lib/bridge-output.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -911,14 +912,7 @@ function formatSessionReply(output, result) {
 }
 
 function looksLikeDirectFeishuReplyConfirmation(output) {
-  const text = String(output || '').trim();
-  if (!text) return false;
-  if (text.length > 1000) return false;
-  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() || '';
-  return (
-    /^已回复飞书消息[:：]/.test(firstLine) &&
-    /(?:消息\s*ID|message\s*id)\s*[:：]/i.test(text)
-  );
+  return isFeishuSelfSendReceipt(output);
 }
 
 async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
