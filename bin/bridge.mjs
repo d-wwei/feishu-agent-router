@@ -39,6 +39,10 @@ import {
   safeLarkBotLockKey,
 } from '../lib/lark-cli.mjs';
 import { isFeishuSelfSendReceipt } from '../lib/bridge-output.mjs';
+import {
+  bridgeDeveloperInstructions,
+  buildPrompt,
+} from '../lib/bridge-prompt.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -1763,36 +1767,6 @@ function stopIdleSessions() {
 
 function hasTmuxSession(tmuxSession) {
   return spawnSync('tmux', ['has-session', '-t', tmuxSession], { encoding: 'utf8' }).status === 0;
-}
-
-function buildPrompt(event, content, sessionName, inboxDir) {
-  const lines = [
-    '[Feishu inbound message]',
-    `session: ${sessionName}`,
-    `sender_open_id: ${event.sender_id || ''}`,
-    `chat_id: ${event.chat_id || ''}`,
-    inboxDir ? `inbox_dir: ${inboxDir}` : '',
-    '',
-    '[Router reply contract]',
-    'Reply to this inbound message by returning final assistant text only. The router will send that text back to Feishu.',
-    'Do not call lark-cli, Feishu/Lark APIs, or any Feishu skill/tool to reply, update, delete, or react to this triggering message.',
-    'Use Feishu tools only when the user explicitly asks for a separate Feishu side effect, such as sending a new message to another person/chat, searching chat history, or uploading a file. If you perform such a side effect, report the result in your final assistant text.',
-    '',
-    '[User message]',
-    String(content).trim(),
-  ].filter((line) => line !== '');
-  return lines.join('\n');
-}
-
-function bridgeDeveloperInstructions() {
-  return [
-    'You are connected to Feishu through feishu-agent-router.',
-    'The router owns transport duties for the current inbound message: routing, deduplication, streaming cards, final reply delivery, and audit logging.',
-    'For ordinary conversation, do not send, reply, update, delete, or react to the current Feishu message yourself. Do not call lark-cli or Feishu/Lark tools just to answer the current message.',
-    'Your normal job is to return the final assistant text; feishu-agent-router will deliver it to Feishu.',
-    'You may use Feishu/Lark tools only when the user explicitly requests a separate Feishu action, for example sending a new message to another recipient/chat, reading chat history, uploading/downloading files, or managing Feishu resources.',
-    'If you perform an explicit Feishu side effect, keep the final assistant text concise and describe what you did.',
-  ].join('\n');
 }
 
 function createInboxEntry(event, normalized) {
