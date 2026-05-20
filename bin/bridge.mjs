@@ -12,6 +12,7 @@ import {
 } from '../lib/feishu-ingest.mjs';
 import {
   buildFinalCardContent,
+  hasComplexMarkdown,
   buildMessageContent,
   buildStreamingCardContent,
 } from '../lib/feishu-render.mjs';
@@ -76,7 +77,9 @@ const cfg = {
   codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', true),
   feishuRichReplies: boolEnv('FTB_FEISHU_RICH_REPLIES', true),
   feishuReactions: boolEnv('FTB_FEISHU_REACTIONS', true),
-  feishuStreaming: boolEnv('FTB_FEISHU_STREAMING', false),
+  feishuStreamingMode: streamingModeEnv('FTB_FEISHU_STREAMING', 'auto'),
+  feishuStreamStartDelayMs: intEnv('FTB_FEISHU_STREAM_START_DELAY_MS', 5_000),
+  feishuStreamMinChars: intEnv('FTB_FEISHU_STREAM_MIN_CHARS', 240),
   feishuStreamPatchMs: intEnv('FTB_FEISHU_STREAM_PATCH_MS', 2_000),
 };
 
@@ -121,6 +124,13 @@ function boolEnv(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+}
+
+function streamingModeEnv(name, fallback) {
+  const raw = env(name, fallback).toLowerCase();
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(raw)) return 'off';
+  if (['1', 'true', 'yes', 'on', 'always'].includes(raw)) return 'always';
+  return 'auto';
 }
 
 function csvEnv(name, fallback = '') {
@@ -553,7 +563,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
   const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
   await maybeReactPhase1(event, content);
-  const stream = cfg.feishuStreaming ? startStreamingReply(event.message_id || event.id) : null;
+  const stream = createStreamingReplyController(event.message_id || event.id, content);
   const result = await runSessionWithFallback(sessionName, backend, prompt, {
     onDelta: (deltaText) => stream?.update(deltaText),
   });
@@ -1211,32 +1221,61 @@ function createReaction(messageId, emojiType, phase) {
   log('reaction created', { messageId, emojiType, phase });
 }
 
-function startStreamingReply(parentMessageId) {
-  if (!parentMessageId) return null;
-  const initial = buildStreamingCardContent('正在处理...');
-  const result = sendReplyPayload(parentMessageId, initial);
-  if (!result.ok || !result.messageId) {
-    log('streaming reply start failed', {
-      parentMessageId,
-      stderr: result.stderr || '',
-      stdout: result.stdout || '',
-    });
-    return null;
-  }
-
+function createStreamingReplyController(parentMessageId, inputText) {
+  if (!parentMessageId || cfg.feishuStreamingMode === 'off') return null;
+  const immediate = cfg.feishuStreamingMode === 'always';
+  const likelyLong = immediate || likelyNeedsStreaming(inputText);
+  let result = null;
+  let started = false;
+  let closed = false;
   let lastPatchAt = 0;
   let lastText = '';
-  let closed = false;
+  const startedAt = Date.now();
+  const timer = likelyLong && !immediate
+    ? setTimeout(() => ensureStarted(lastText || '正在处理...'), cfg.feishuStreamStartDelayMs)
+    : null;
+  timer?.unref?.();
+
+  function shouldStart(body) {
+    if (closed || started) return false;
+    if (immediate) return true;
+    if (Date.now() - startedAt < cfg.feishuStreamStartDelayMs) return false;
+    if (likelyLong) return true;
+    return body.length >= cfg.feishuStreamMinChars || hasComplexMarkdown(body);
+  }
+
+  function ensureStarted(seedText) {
+    if (closed) return false;
+    if (started) return true;
+    const body = trimReply(seedText || '正在处理...');
+    if (!shouldStart(body)) return false;
+    const initial = buildStreamingCardContent(body);
+    const sent = sendReplyPayload(parentMessageId, initial);
+    if (!sent.ok || !sent.messageId) {
+      log('streaming reply start failed', {
+        parentMessageId,
+        stderr: sent.stderr || '',
+        stdout: sent.stdout || '',
+      });
+      return false;
+    }
+    result = sent;
+    started = true;
+    lastPatchAt = Date.now();
+    lastText = body;
+    return true;
+  }
 
   return {
     update(text) {
       if (closed) return false;
       const body = trimReply(text);
       if (!body || body === lastText || body === '(empty)') return true;
+      lastText = body;
+      if (!ensureStarted(body)) return true;
       const nowMs = Date.now();
       if (nowMs - lastPatchAt < cfg.feishuStreamPatchMs) return true;
       lastPatchAt = nowMs;
-      lastText = body;
       const payload = buildStreamingCardContent(body);
       const patched = patchMessagePayload(result.messageId, payload);
       if (!patched.ok) {
@@ -1251,6 +1290,8 @@ function startStreamingReply(parentMessageId) {
     finish(text) {
       if (closed) return false;
       closed = true;
+      if (timer) clearTimeout(timer);
+      if (!started || !result?.messageId) return false;
       const payload = buildFinalCardContent(trimReply(text));
       const patched = patchMessagePayload(result.messageId, payload);
       if (!patched.ok) {
@@ -1264,6 +1305,13 @@ function startStreamingReply(parentMessageId) {
       return patched.ok;
     },
   };
+}
+
+function likelyNeedsStreaming(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (text.length >= cfg.feishuStreamMinChars) return true;
+  return /实现|开发|修改|重构|排查|诊断|分析|测试|安装|部署|迁移|规划|整理|总结|对比|review|debug|implement|refactor|analy[sz]e|install|deploy|migrate|plan|summari[sz]e|compare/i.test(text);
 }
 
 async function reply(messageId, text) {
