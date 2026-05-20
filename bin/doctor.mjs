@@ -31,7 +31,9 @@ for (const bin of bins) {
 
 const appServer = spawnSync('codex', ['app-server', '--help'], { encoding: 'utf8' });
 console.log(`${appServer.status === 0 ? 'ok' : 'missing'} codex app-server`);
-console.log(`${typeof WebSocket === 'function' ? 'ok' : 'missing'} node WebSocket global`);
+const appServerHelp = `${appServer.stdout || ''}\n${appServer.stderr || ''}`;
+const hasModernTransport = appServerHelp.includes('stdio://') && appServerHelp.includes('unix://');
+console.log(`${hasModernTransport ? 'ok' : 'missing'} codex app-server stdio/unix transport`);
 
 console.log(`${fs.existsSync(envPath) ? 'ok' : 'missing'} env -> ${envPath}`);
 if (!fs.existsSync(envPath)) {

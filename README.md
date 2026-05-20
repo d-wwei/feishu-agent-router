@@ -272,14 +272,25 @@ Feishu UX migration:
 - Message reactions are added as best-effort phase feedback when the bot has reaction permission
 - Permission cards can be rendered, but button callback handling is not wired until the active `lark-cli` event catalog exposes card action events; text fallback commands remain the safe path
 - Streaming replies default to `FTB_FEISHU_STREAMING=auto`: short replies are sent once as final messages, while likely long/complex tasks start a streaming card after `FTB_FEISHU_STREAM_START_DELAY_MS`; set it to `always` or `off` to override
+- When Codex is still cold or prewarming, Router sends one updatable card after `FTB_COLD_START_CARD_DELAY_MS` and patches that same card with the final answer.
+- Router owns replies to the current inbound message. Codex should return final
+  text for Router to deliver; direct Feishu/Lark tool calls are reserved for
+  explicit side effects such as sending a new message to another chat or reading
+  chat history.
 
 ## Backends
 
 `codex-app-server` is the preferred backend for Codex. It starts one local
-`codex app-server --listen ws://127.0.0.1:<port>` process and sends each Feishu
-message as a structured `turn/start` request. The session stores the Codex
-`threadId`, so future messages resume the same Codex thread without parsing a
-terminal screen.
+`codex app-server --listen stdio://` process by default and sends each Feishu
+message as a structured `turn/start` request over newline-delimited JSON. The
+session stores the Codex `threadId`, so future messages resume the same Codex
+thread without parsing a terminal screen.
+
+For deployments that prefer a socket, set:
+
+```text
+FTB_CODEX_APP_SERVER_LISTEN=unix:///absolute/path/to/codex-app-server.sock
+```
 
 By default, the Codex backend is configured for remote-office control:
 
@@ -287,6 +298,15 @@ By default, the Codex backend is configured for remote-office control:
 FTB_CODEX_SANDBOX=danger-full-access
 FTB_CODEX_APPROVAL_POLICY=never
 FTB_CODEX_AUTO_APPROVE_REQUESTS=true
+FTB_CODEX_RESPONSES_WEBSOCKETS=false
+FTB_CODEX_FORCE_RESPONSES_HTTP=true
+FTB_CODEX_HTTP_PROVIDER_ID=chatgpt_http
+FTB_CODEX_HTTP_PROVIDER_BASE_URL=https://chatgpt.com/backend-api/codex
+FTB_PREWARM_CODEX=true
+FTB_PREWARM_SESSIONS=main
+FTB_PREWARM_TURN=false
+FTB_CODEX_REQUEST_TIMEOUT_MS=120000
+FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS=90000
 ```
 
 The tmux fallback command also defaults to:
@@ -296,7 +316,19 @@ codex --no-alt-screen --cd <cwd> --sandbox danger-full-access -a never
 ```
 
 These defaults avoid permission prompts and sandbox blocks while controlling
-the machine from Feishu. They can be tightened in `.env` per deployment.
+the machine from Feishu. Response websockets are disabled on the bridge path so
+Codex uses HTTP streaming instead of waiting on a stalled websocket first event.
+For newer Codex builds where the removed `responses_websockets` feature flag no
+longer controls the built-in ChatGPT provider, `FTB_CODEX_FORCE_RESPONSES_HTTP`
+adds a local provider override with `wire_api="responses"` and
+`supports_websockets=false`. The first-output timeout interrupts any remaining
+stuck Codex turn before Feishu waits for Codex's internal 300s stall guard.
+`FTB_PREWARM_CODEX=true` starts the app-server and resumes/creates listed Codex
+threads when the bridge starts, so the first Feishu message no longer pays the
+process/thread cold-start cost. Each app-server turn logs `appServerReadyMs`,
+`threadReadyMs`, `firstOutputMs`, `turnCompletedMs`, `feishuReplyMs`, and
+`totalMs` to `logs/router.log`.
+They can be tightened in `.env` per deployment.
 
 `tmux` remains available as a fallback. If a `codex-app-server` session fails
 and the session does not set `"fallback": false`, the router sends the same

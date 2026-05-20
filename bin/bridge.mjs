@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process';
-import { once } from 'node:events';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -89,9 +89,11 @@ const cfg = {
   restartDelayMs: intEnv('FTB_RESTART_DELAY_MS', 3_000),
   idleStopMs: intEnv('FTB_IDLE_STOP_MS', 0),
   codexPath: env('FTB_CODEX_PATH', 'codex'),
-  codexAppServerPort: optionalIntEnv('FTB_CODEX_APP_SERVER_PORT'),
+  codexAppServerListen: env('FTB_CODEX_APP_SERVER_LISTEN', ''),
   codexRequestTimeoutMs: intEnv('FTB_CODEX_REQUEST_TIMEOUT_MS', 120_000),
   codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
+  codexFirstOutputTimeoutMs: intEnv('FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', 90_000),
+  codexExecTimeoutMs: intEnv('FTB_CODEX_EXEC_TIMEOUT_MS', 120_000),
   codexProfile: env('FTB_CODEX_PROFILE', ''),
   codexModel: env('FTB_CODEX_MODEL', ''),
   codexModelProvider: env('FTB_CODEX_MODEL_PROVIDER', ''),
@@ -101,9 +103,18 @@ const cfg = {
   codexApprovalPolicy: env('FTB_CODEX_APPROVAL_POLICY', 'never'),
   codexNetworkAccess: boolEnv('FTB_CODEX_NETWORK_ACCESS', true),
   codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', true),
+  codexResponsesWebSockets: boolEnv('FTB_CODEX_RESPONSES_WEBSOCKETS', false),
+  codexForceResponsesHttp: boolEnv('FTB_CODEX_FORCE_RESPONSES_HTTP', true),
+  codexHttpProviderId: env('FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
+  codexHttpProviderName: env('FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
+  codexHttpProviderBaseUrl: env('FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
+  prewarmCodex: boolEnv('FTB_PREWARM_CODEX', true),
+  prewarmSessions: csvEnv('FTB_PREWARM_SESSIONS', env('FTB_DEFAULT_SESSION', 'main')),
+  prewarmTurn: boolEnv('FTB_PREWARM_TURN', false),
   feishuRichReplies: boolEnv('FTB_FEISHU_RICH_REPLIES', true),
   feishuReactions: boolEnv('FTB_FEISHU_REACTIONS', true),
   feishuStreamingMode: streamingModeEnv('FTB_FEISHU_STREAMING', 'auto'),
+  coldStartCardDelayMs: intEnv('FTB_COLD_START_CARD_DELAY_MS', 1_500),
   feishuStreamStartDelayMs: intEnv('FTB_FEISHU_STREAM_START_DELAY_MS', 5_000),
   feishuStreamMinChars: intEnv('FTB_FEISHU_STREAM_MIN_CHARS', 240),
   feishuStreamPatchMs: intEnv('FTB_FEISHU_STREAM_PATCH_MS', 2_000),
@@ -112,6 +123,13 @@ const cfg = {
 let state = loadState();
 let queue = Promise.resolve();
 let shuttingDown = false;
+let prewarmState = {
+  status: cfg.prewarmCodex ? 'pending' : 'disabled',
+  startedAt: null,
+  completedAt: null,
+  sessions: [],
+  error: null,
+};
 validateExplicitLarkBotConfig();
 const larkBotLock = acquireLarkBotLock();
 
@@ -120,6 +138,7 @@ if (cfg.idleStopMs > 0) {
   setInterval(stopIdleSessions, Math.min(cfg.idleStopMs, 60_000)).unref?.();
 }
 startEventConsumer();
+scheduleCodexPrewarm();
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
@@ -174,13 +193,6 @@ function csvEnv(name, fallback = '') {
 function intEnv(name, fallback) {
   const value = Number.parseInt(env(name, String(fallback)), 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function optionalIntEnv(name) {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return null;
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function loadState() {
@@ -244,6 +256,15 @@ function log(message, extra) {
   const line = `[${now()}] ${message}${extra ? ` ${JSON.stringify(extra)}` : ''}`;
   console.log(line);
   fs.appendFileSync(LOG_PATH, `${line}\n`);
+}
+
+function logCodexAppServerStderr(chunk) {
+  for (const rawLine of chunk.toString().split(/\r?\n/)) {
+    const text = rawLine.trim();
+    if (!text) continue;
+    const compact = text.length > 1200 ? `${text.slice(0, 1200)} ... [truncated]` : text;
+    log(`[codex app-server] ${compact}`);
+  }
 }
 
 function run(cmd, args, opts = {}) {
@@ -390,6 +411,108 @@ function startEventConsumer() {
       setTimeout(startEventConsumer, cfg.restartDelayMs);
     }
   });
+}
+
+function scheduleCodexPrewarm() {
+  if (!cfg.prewarmCodex) {
+    log('codex prewarm disabled');
+    return;
+  }
+  setTimeout(() => {
+    prewarmCodex().catch((error) => {
+      prewarmState = {
+        ...prewarmState,
+        status: 'failed',
+        completedAt: now(),
+        error: error.message || String(error),
+      };
+      log('codex prewarm failed', { error: stackOf(error) });
+    });
+  }, 0).unref?.();
+}
+
+async function prewarmCodex() {
+  if (!cfg.prewarmCodex || prewarmState.status === 'running' || prewarmState.status === 'ready') {
+    return;
+  }
+  const startedAt = Date.now();
+  prewarmState = {
+    status: 'running',
+    startedAt: now(),
+    completedAt: null,
+    sessions: [],
+    error: null,
+  };
+  log('codex prewarm starting', {
+    sessions: cfg.prewarmSessions,
+    warmupTurn: cfg.prewarmTurn,
+    listenUrl: cfg.codexAppServerListen || 'stdio://',
+  });
+
+  reloadState();
+  const appServerStartedAt = Date.now();
+  await codexAppServer.ensureReady();
+  const appServerReadyMs = Date.now() - appServerStartedAt;
+  const sessions = [];
+
+  for (const sessionName of cfg.prewarmSessions) {
+    const session = state.sessions[sessionName];
+    if (!session) {
+      sessions.push({ sessionName, skipped: 'missing' });
+      continue;
+    }
+    if (session.backend !== 'codex-app-server') {
+      sessions.push({ sessionName, skipped: `backend:${session.backend}` });
+      continue;
+    }
+    const timing = {};
+    const threadId = await ensureCodexThread(sessionName, timing);
+    updateSessionFields(sessionName, { state: 'running', updatedAt: now() });
+    sessions.push({
+      sessionName,
+      threadId,
+      appServerReadyMs: timing.appServerReadyMs,
+      threadReadyMs: timing.threadReadyMs,
+    });
+  }
+
+  let warmupTurnMs = null;
+  if (cfg.prewarmTurn) {
+    warmupTurnMs = await runCodexWarmupTurn();
+  }
+
+  prewarmState = {
+    status: 'ready',
+    startedAt: prewarmState.startedAt,
+    completedAt: now(),
+    sessions,
+    error: null,
+  };
+  log('codex prewarm completed', {
+    appServerReadyMs,
+    sessions,
+    warmupTurnMs,
+    totalMs: Date.now() - startedAt,
+  });
+}
+
+async function runCodexWarmupTurn() {
+  const startedAt = Date.now();
+  const result = await codexAppServer.threadStart({
+    cwd: cfg.defaultWorkdir,
+    ...buildCodexThreadParams(cfg),
+    developerInstructions: bridgeDeveloperInstructions(),
+    experimentalRawEvents: false,
+    persistExtendedHistory: false,
+  });
+  await codexAppServer.turnStart({
+    threadId: result.thread.id,
+    input: [{ type: 'text', text: 'Warm up the Codex transport. Reply READY only.', text_elements: [] }],
+    cwd: cfg.defaultWorkdir,
+    approvalPolicy: cfg.codexApprovalPolicy,
+    ...buildCodexTurnParams(cfg),
+  }, { timing: {} });
+  return Date.now() - startedAt;
 }
 
 async function handleEvent(event) {
@@ -676,37 +799,104 @@ async function sendToResolvedSession(event, content, opts = {}) {
 async function sendToSession(event, sessionName, content, opts = {}) {
   const session = getSession(sessionName);
   const backend = backendFor(session);
-  const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
-  const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
-  await maybeReactPhase1(event, content);
-  const stream = createStreamingReplyController(event.message_id || event.id, content);
-  let result;
+  const timing = createTurnTiming();
+  let backendName = session.backend;
+  let stream = null;
   try {
-    result = await runSessionWithFallback(sessionName, backend, prompt, {
-      onDelta: (deltaText) => stream?.update(deltaText),
+    const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
+    const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
+    await maybeReactPhase1(event, content);
+    stream = createStreamingReplyController(event.message_id || event.id, content, {
+      coldStart: shouldShowColdStartCard(sessionName, session),
     });
+    const result = await runSessionWithFallback(sessionName, backend, prompt, {
+      onDelta: (deltaText) => stream?.update(deltaText),
+      timing,
+    });
+    const { output, elapsedMs, stable, backendName: resultBackendName, fallbackReason } = result;
+    backendName = resultBackendName || backendName;
+    log('session turn completed', { sessionName, backend: backendName, elapsedMs, stable, fallback: Boolean(fallbackReason) });
+    if (looksLikeDirectFeishuReplyConfirmation(output)) {
+      stream?.discard();
+      timing.routerReplySuppressed = true;
+      log('suppressed router reply because agent already replied through Feishu', { sessionName });
+      await maybeReactPhase2(event, content, output);
+      logTurnTiming(sessionName, backendName, timing, { suppressedRouterReply: true });
+      return;
+    }
+    const text = output.trim()
+      ? formatSessionReply(output, result)
+      : `已投递到 ${sessionName}，但 ${Math.round(cfg.maxWaitMs / 1000)}s 内没有捕获到新输出。`;
+    const finalText = stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`;
+    const replyStartedAt = Date.now();
+    const streamDelivered = stream?.finish(finalText) || false;
+    if (!streamDelivered) await reply(event.message_id || event.id, finalText);
+    timing.feishuReplyMs = Date.now() - replyStartedAt;
+    await maybeReactPhase2(event, content, text);
+    logTurnTiming(sessionName, backendName, timing);
   } catch (error) {
-    const message = error.message || String(error);
-    log('session turn failed', { sessionName, error: message });
-    const failureText = [
-      `投递到 ${sessionName} 失败。`,
-      '',
-      message,
-      '',
-      '桥接服务仍在运行；请稍后重试，或发 /status 查看 session 状态。',
-    ].join('\n');
-    if (!stream?.finish(failureText)) await reply(event.message_id || event.id, failureText);
-    return;
+    const messageId = event.message_id || event.id;
+    const body = userFacingSessionError(error, sessionName);
+    const replyStartedAt = Date.now();
+    const streamDelivered = stream?.finish(body) || false;
+    if (!streamDelivered) await reply(messageId, body);
+    timing.feishuReplyMs = Date.now() - replyStartedAt;
+    logTurnTiming(sessionName, backendName, timing, {
+      failed: true,
+      error: error.message || String(error),
+    });
+    log('session turn failed and user was notified', {
+      sessionName,
+      backend: backendName,
+      error: error.message || String(error),
+    });
   }
-  const { output, elapsedMs, stable, backendName, fallbackReason } = result;
-  log('session turn completed', { sessionName, backend: backendName, elapsedMs, stable, fallback: Boolean(fallbackReason) });
-  const text = output.trim()
-    ? formatSessionReply(output, result)
-    : `已投递到 ${sessionName}，但 ${Math.round(cfg.maxWaitMs / 1000)}s 内没有捕获到新输出。`;
-  const finalText = stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`;
-  const streamDelivered = stream?.finish(finalText) || false;
-  if (!streamDelivered) await reply(event.message_id || event.id, finalText);
-  await maybeReactPhase2(event, content, text);
+}
+
+function createTurnTiming() {
+  return { totalStartedAt: Date.now() };
+}
+
+function logTurnTiming(sessionName, backendName, timing, extra = {}) {
+  const metrics = { ...timing };
+  const totalStartedAt = metrics.totalStartedAt;
+  delete metrics.totalStartedAt;
+  log('session turn timing', {
+    sessionName,
+    backend: backendName,
+    ...metrics,
+    totalMs: totalStartedAt ? Date.now() - totalStartedAt : undefined,
+    ...extra,
+  });
+}
+
+function isCodexFirstOutputTimeout(error) {
+  return error?.code === 'CODEX_FIRST_OUTPUT_TIMEOUT' ||
+    /Timed out waiting for first Codex output event/i.test(error?.message || '');
+}
+
+function userFacingSessionError(error, sessionName) {
+  if (isCodexFirstOutputTimeout(error)) {
+    return [
+      'Codex 这轮没有及时开始输出，我已经中断并重置了会话。',
+      `你可以直接重发刚才那句，session=${sessionName}。`,
+    ].join('\n');
+  }
+  return [
+    `投递到 ${sessionName} 失败。`,
+    '',
+    error?.message || String(error),
+    '',
+    '桥接服务仍在运行；请稍后重试，或发 /status 查看 session 状态。',
+  ].join('\n');
+}
+
+function shouldShowColdStartCard(sessionName, session) {
+  if (cfg.feishuStreamingMode === 'off') return false;
+  if (session.backend !== 'codex-app-server') return false;
+  if (prewarmState.status !== 'ready') return true;
+  if (!session.threadId) return true;
+  return !codexAppServer.hasThread(session.threadId);
 }
 
 function formatSessionReply(output, result) {
@@ -718,6 +908,17 @@ function formatSessionReply(output, result) {
     `[fallback: ${result.backendName}; ${(result.elapsedMs / 1000).toFixed(1)}s]`,
     result.fallbackReason,
   ].join('\n');
+}
+
+function looksLikeDirectFeishuReplyConfirmation(output) {
+  const text = String(output || '').trim();
+  if (!text) return false;
+  if (text.length > 1000) return false;
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() || '';
+  return (
+    /^已回复飞书消息[:：]/.test(firstLine) &&
+    /(?:消息\s*ID|message\s*id)\s*[:：]/i.test(text)
+  );
 }
 
 async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
@@ -764,10 +965,16 @@ function getSession(name) {
   return session;
 }
 
-async function ensureCodexThread(name) {
+async function ensureCodexThread(name, timing) {
+  const appServerStartedAt = Date.now();
   await codexAppServer.ensureReady();
+  if (timing) timing.appServerReadyMs = Date.now() - appServerStartedAt;
+  const threadStartedAt = Date.now();
   const session = getSession(name);
-  if (session.threadId && codexAppServer.hasThread(session.threadId)) return session.threadId;
+  if (session.threadId && codexAppServer.hasThread(session.threadId)) {
+    if (timing) timing.threadReadyMs = Date.now() - threadStartedAt;
+    return session.threadId;
+  }
 
   if (session.threadId) {
     try {
@@ -775,7 +982,10 @@ async function ensureCodexThread(name) {
         threadId: session.threadId,
         cwd: session.cwd || cfg.defaultWorkdir,
         ...buildCodexThreadParams(cfg),
+        developerInstructions: bridgeDeveloperInstructions(),
+        persistExtendedHistory: false,
       });
+      if (timing) timing.threadReadyMs = Date.now() - threadStartedAt;
       return session.threadId;
     } catch (error) {
       log('codex thread resume failed; starting a new thread', {
@@ -789,9 +999,13 @@ async function ensureCodexThread(name) {
   const result = await codexAppServer.threadStart({
     cwd: session.cwd || cfg.defaultWorkdir,
     ...buildCodexThreadParams(cfg),
+    developerInstructions: bridgeDeveloperInstructions(),
+    experimentalRawEvents: false,
+    persistExtendedHistory: false,
   });
   const threadId = result.thread.id;
   updateSessionFields(name, { threadId, updatedAt: now() });
+  if (timing) timing.threadReadyMs = Date.now() - threadStartedAt;
   return threadId;
 }
 
@@ -802,9 +1016,9 @@ class CodexAppServerClient {
     this.turns = new Map();
     this.liveThreads = new Set();
     this.child = null;
-    this.ws = null;
+    this.transport = null;
     this.ready = null;
-    this.port = null;
+    this.listenUrl = null;
   }
 
   async ensureReady() {
@@ -814,50 +1028,43 @@ class CodexAppServerClient {
   }
 
   async start() {
-    if (typeof WebSocket !== 'function') {
-      throw new Error('当前 Node.js 没有全局 WebSocket，无法使用 codex-app-server backend。');
-    }
-    this.port = cfg.codexAppServerPort || await allocatePort();
-    const listenUrl = `ws://127.0.0.1:${this.port}`;
+    const listenUrl = this.resolveListenUrl();
     const args = ['app-server', '--listen', listenUrl, ...buildCodexCliConfigArgs(cfg)];
     log('starting codex app-server', {
       listenUrl,
       profile: cfg.codexProfile || undefined,
       model: cfg.codexModel || undefined,
       modelProvider: cfg.codexModelProvider || undefined,
+      forceResponsesHttp: cfg.codexForceResponsesHttp && cfg.codexResponsesWebSockets === false,
     });
+    if (listenUrl.startsWith('unix://')) {
+      try { fs.unlinkSync(unixSocketPath(listenUrl)); } catch {}
+    }
     this.child = spawn(cfg.codexPath, args, {
       cwd: ROOT,
       env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: listenUrl === 'stdio://' ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
     });
-    this.child.stdout?.on('data', (chunk) => {
-      const text = chunk.toString().trim();
-      if (text) log(`[codex app-server] ${text}`);
+    this.listenUrl = listenUrl;
+    this.child.once('error', (error) => {
+      log('codex app-server spawn failed', { error: error.message || String(error) });
+      this.rejectAll(error);
+      this.transport = null;
+      this.ready = null;
+      this.liveThreads.clear();
     });
-    this.child.stderr?.on('data', (chunk) => {
-      const text = chunk.toString().trim();
-      if (text) log(`[codex app-server] ${text}`);
-    });
+    this.child.stderr?.on('data', (chunk) => logCodexAppServerStderr(chunk));
     this.child.once('exit', (code, signal) => {
       log('codex app-server exited', { code, signal });
       this.rejectAll(new Error(`Codex app-server exited: ${signal || code}`));
-      this.ws = null;
+      this.transport = null;
       this.ready = null;
       this.liveThreads.clear();
     });
 
-    await waitForWebSocket(listenUrl, cfg.codexStartTimeoutMs);
-    this.ws = new WebSocket(listenUrl);
-    this.ws.addEventListener('message', (event) => this.handleMessage(event.data));
-    this.ws.addEventListener('close', () => {
-      this.rejectAll(new Error('Codex app-server websocket closed'));
-      this.ws = null;
-      this.ready = null;
-      this.liveThreads.clear();
-    });
-    this.ws.addEventListener('error', () => log('codex app-server websocket error'));
-    await waitForWebSocketOpen(this.ws, cfg.codexStartTimeoutMs);
+    this.transport = listenUrl === 'stdio://'
+      ? this.createStdioTransport()
+      : await this.createUnixTransport(listenUrl);
 
     await this.request('initialize', {
       clientInfo: { name: 'feishu-agent-router', title: 'Feishu Agent Router', version: '0.1.0' },
@@ -868,6 +1075,73 @@ class CodexAppServerClient {
       },
     });
     this.notify('initialized');
+  }
+
+  resolveListenUrl() {
+    const listenUrl = cfg.codexAppServerListen || 'stdio://';
+    if (listenUrl === 'stdio://') return listenUrl;
+    if (listenUrl === 'unix://') return `unix://${path.join(LOG_DIR, 'codex-app-server.sock')}`;
+    if (listenUrl.startsWith('unix://')) return listenUrl;
+    if (listenUrl.startsWith('ws://') || listenUrl.startsWith('wss://')) {
+      throw new Error('当前 Codex app-server 不再支持 ws:// 监听；请设置 FTB_CODEX_APP_SERVER_LISTEN=stdio:// 或 unix://PATH。');
+    }
+    if (listenUrl === 'off') {
+      throw new Error('codex-app-server backend 需要可用 transport；FTB_CODEX_APP_SERVER_LISTEN 不能为 off。');
+    }
+    throw new Error(`不支持的 Codex app-server listen URL：${listenUrl}`);
+  }
+
+  createStdioTransport() {
+    if (!this.child?.stdin || !this.child?.stdout) {
+      throw new Error('Codex app-server stdio transport is unavailable');
+    }
+    const rl = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
+    rl.on('line', (line) => this.handleTransportLine(line));
+    this.child.stdout.on('close', () => {
+      this.rejectAll(new Error('Codex app-server stdio closed'));
+      this.transport = null;
+      this.ready = null;
+      this.liveThreads.clear();
+    });
+    return {
+      kind: 'stdio',
+      send: (payload) => this.child.stdin.write(`${JSON.stringify(payload)}\n`),
+      close: () => {
+        rl.close();
+        try { this.child.stdin.end(); } catch {}
+      },
+    };
+  }
+
+  async createUnixTransport(listenUrl) {
+    const socketPath = unixSocketPath(listenUrl);
+    const { socket, initialData } = await connectUnixWebSocket(socketPath, cfg.codexStartTimeoutMs);
+    const wsState = { buffer: Buffer.alloc(0), fragments: [] };
+    const onData = (chunk) => {
+      consumeWebSocketFrames(wsState, chunk, {
+        onText: (text) => this.handleMessage(text),
+        onPing: (payload) => sendWebSocketFrame(socket, 0xA, payload),
+        onClose: () => socket.end(),
+      });
+    };
+    socket.on('data', onData);
+    if (initialData.length) onData(initialData);
+    socket.on('close', () => {
+      this.rejectAll(new Error('Codex app-server unix socket closed'));
+      this.transport = null;
+      this.ready = null;
+      this.liveThreads.clear();
+    });
+    socket.on('error', (error) => log('codex app-server unix socket error', { error: error.message || String(error) }));
+    return {
+      kind: 'unix',
+      send: (payload) => sendWebSocketText(socket, JSON.stringify(payload)),
+      close: () => {
+        socket.off('data', onData);
+        try { sendWebSocketFrame(socket, 0x8, Buffer.alloc(0)); } catch {}
+        socket.end();
+      },
+    };
   }
 
   hasThread(threadId) {
@@ -887,27 +1161,45 @@ class CodexAppServerClient {
   }
 
   async turnStart(params, opts = {}) {
+    const turnStartedAt = Date.now();
     const result = await this.request('turn/start', params);
     const turnId = result.turn.id;
     return new Promise((resolve, reject) => {
-      this.turns.set(turnId, {
-        threadId: params.threadId,
-        text: '',
-        final: '',
-        lastError: null,
-        onDelta: opts.onDelta,
-        resolve,
-        reject,
-      });
-      setTimeout(() => {
+      const firstOutputTimer = setTimeout(() => {
+        const turn = this.turns.get(turnId);
+        if (!turn) return;
+        this.turns.delete(turnId);
+        this.request('turn/interrupt', { threadId: params.threadId, turnId }).catch((error) => {
+          log('codex turn interrupt failed after first-output timeout', { error: error.message || String(error) });
+        });
+        this.clearTurnTimers(turn);
+        const error = new Error(`Timed out waiting for first Codex output event after ${Math.round(cfg.codexFirstOutputTimeoutMs / 1000)}s`);
+        error.code = 'CODEX_FIRST_OUTPUT_TIMEOUT';
+        reject(error);
+      }, cfg.codexFirstOutputTimeoutMs);
+      const completionTimer = setTimeout(() => {
         const turn = this.turns.get(turnId);
         if (!turn) return;
         this.turns.delete(turnId);
         this.request('turn/interrupt', { threadId: params.threadId, turnId }).catch((error) => {
           log('codex turn interrupt after timeout failed', { turnId, error: error.message || String(error) });
         });
+        this.clearTurnTimers(turn);
         reject(new Error('Timed out waiting for turn/completed; interrupt requested'));
       }, cfg.codexRequestTimeoutMs);
+      this.turns.set(turnId, {
+        threadId: params.threadId,
+        text: '',
+        final: '',
+        lastError: null,
+        onDelta: opts.onDelta,
+        startedAt: turnStartedAt,
+        timing: opts.timing,
+        firstOutputTimer,
+        completionTimer,
+        resolve,
+        reject,
+      });
     });
   }
 
@@ -940,10 +1232,15 @@ class CodexAppServerClient {
   }
 
   send(payload) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Codex app-server websocket is not open');
+    if (!this.transport) {
+      throw new Error('Codex app-server transport is not open');
     }
-    this.ws.send(JSON.stringify(payload));
+    this.transport.send(payload);
+  }
+
+  handleTransportLine(line) {
+    if (!line.trim()) return;
+    this.handleMessage(line);
   }
 
   handleMessage(raw) {
@@ -977,6 +1274,7 @@ class CodexAppServerClient {
     if (msg.method === 'item/agentMessage/delta') {
       const turn = this.turns.get(msg.params.turnId);
       if (turn) {
+        this.markTurnOutputStarted(turn);
         turn.text += msg.params.delta || '';
         if (typeof turn.onDelta === 'function') {
           try {
@@ -991,6 +1289,7 @@ class CodexAppServerClient {
     if (msg.method === 'item/completed') {
       const turn = this.turns.get(msg.params.turnId);
       if (turn && msg.params.item?.type === 'agentMessage') {
+        this.markTurnOutputStarted(turn);
         turn.final = msg.params.item.text || turn.text;
       }
       return;
@@ -1008,6 +1307,8 @@ class CodexAppServerClient {
       const turn = this.turns.get(turnId);
       if (!turn) return;
       this.turns.delete(turnId);
+      this.clearTurnTimers(turn);
+      if (turn.timing) turn.timing.turnCompletedMs = Date.now() - turn.startedAt;
       if (msg.params.turn.status === 'failed') {
         turn.reject(new Error(msg.params.turn.error?.message || turn.lastError?.message || 'Codex turn failed'));
       } else {
@@ -1023,14 +1324,35 @@ class CodexAppServerClient {
   handleServerRequest(msg) {
     if (
       msg.method === 'item/commandExecution/requestApproval' ||
-      msg.method === 'item/fileChange/requestApproval' ||
-      msg.method === 'item/permissions/requestApproval'
+      msg.method === 'item/fileChange/requestApproval'
     ) {
       this.send({ id: msg.id, result: { decision: cfg.codexAutoApproveRequests ? 'accept' : 'decline' } });
       return;
     }
-    if (msg.method === 'item/tool/requestUserInput' || msg.method === 'mcpServer/elicitation/request') {
+    if (msg.method === 'item/permissions/requestApproval') {
+      this.send({ id: msg.id, result: permissionApprovalResponse() });
+      return;
+    }
+    if (msg.method === 'item/tool/requestUserInput') {
       this.send({ id: msg.id, result: { answers: {} } });
+      return;
+    }
+    if (msg.method === 'mcpServer/elicitation/request') {
+      this.send({ id: msg.id, result: { action: 'cancel' } });
+      return;
+    }
+    if (msg.method === 'applyPatchApproval' || msg.method === 'execCommandApproval') {
+      this.send({ id: msg.id, result: { decision: cfg.codexAutoApproveRequests ? 'approved' : 'denied' } });
+      return;
+    }
+    if (msg.method === 'item/tool/call') {
+      this.send({
+        id: msg.id,
+        result: {
+          contentItems: [{ type: 'inputText', text: `Unsupported client tool: ${msg.params?.tool || 'unknown'}` }],
+          success: false,
+        },
+      });
       return;
     }
     this.send({ id: msg.id, error: { code: -32000, message: `Unsupported app-server request ${msg.method}` } });
@@ -1043,23 +1365,52 @@ class CodexAppServerClient {
     }
     this.pending.clear();
     for (const [turnId, turn] of this.turns.entries()) {
+      this.clearTurnTimers(turn);
       turn.reject(error);
       this.turns.delete(turnId);
     }
   }
 
+  reset(reason) {
+    log('resetting codex app-server', { reason });
+    this.rejectAll(new Error(`Codex app-server reset: ${reason || 'unknown'}`));
+    try { this.transport?.close(); } catch {}
+    try { this.child?.kill(); } catch {}
+    this.transport = null;
+    this.ready = null;
+    this.child = null;
+    this.liveThreads.clear();
+  }
+
+  markTurnOutputStarted(turn) {
+    if (turn.timing && turn.timing.firstOutputMs === undefined) {
+      turn.timing.firstOutputMs = Date.now() - turn.startedAt;
+    }
+    if (!turn.firstOutputTimer) return;
+    clearTimeout(turn.firstOutputTimer);
+    turn.firstOutputTimer = null;
+  }
+
+  clearTurnTimers(turn) {
+    if (turn.firstOutputTimer) clearTimeout(turn.firstOutputTimer);
+    if (turn.completionTimer) clearTimeout(turn.completionTimer);
+    turn.firstOutputTimer = null;
+    turn.completionTimer = null;
+  }
+
   statusText() {
-    return this.ws?.readyState === WebSocket.OPEN ? `running ws://127.0.0.1:${this.port}` : 'stopped';
+    return this.transport ? `running ${this.listenUrl}` : 'stopped';
   }
 
   close() {
-    try { this.ws?.close(); } catch {}
+    try { this.transport?.close(); } catch {}
     try { this.child?.kill(); } catch {}
   }
 }
 
 function backendFor(session) {
   if (session.backend === 'codex-app-server') return codexAppServerBackend;
+  if (session.backend === 'codex-exec') return codexExecBackend;
   if (session.backend === 'tmux') return tmuxBackend;
   throw new Error(`不支持的 backend：${session.backend}`);
 }
@@ -1068,31 +1419,11 @@ const codexAppServer = new CodexAppServerClient();
 
 const codexAppServerBackend = {
   async ensure(name) {
-    await codexAppServer.ensureReady();
+    await ensureCodexThread(name);
     updateSessionState(name, 'running');
   },
   async run(name, text, opts = {}) {
-    const start = Date.now();
-    const threadId = await ensureCodexThread(name);
-    const output = await codexAppServer.turnStart({
-      threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
-      cwd: getSession(name).cwd || cfg.defaultWorkdir,
-      approvalPolicy: cfg.codexApprovalPolicy,
-      ...buildCodexTurnParams(cfg),
-    }, opts);
-    updateSessionFields(name, {
-      state: 'running',
-      lastOutput: output,
-      lastBackend: 'codex-app-server',
-      updatedAt: now(),
-    });
-    return {
-      output,
-      elapsedMs: Date.now() - start,
-      stable: true,
-      backendName: 'codex-app-server',
-    };
+    return runCodexAppServerTurn(name, text, opts, 0);
   },
   async capture(name) {
     const session = getSession(name);
@@ -1133,6 +1464,171 @@ const codexAppServerBackend = {
     await this.ensure(name);
   },
 };
+
+async function runCodexAppServerTurn(name, text, opts = {}, attempt = 0) {
+  try {
+    const start = Date.now();
+    const threadId = await ensureCodexThread(name, opts.timing);
+    const output = await codexAppServer.turnStart({
+      threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+      cwd: getSession(name).cwd || cfg.defaultWorkdir,
+      approvalPolicy: cfg.codexApprovalPolicy,
+      ...buildCodexTurnParams(cfg),
+    }, opts);
+    updateSessionFields(name, {
+      state: 'running',
+      lastOutput: output,
+      lastBackend: 'codex-app-server',
+      updatedAt: now(),
+    });
+    return {
+      output,
+      elapsedMs: Date.now() - start,
+      stable: true,
+      backendName: 'codex-app-server',
+    };
+  } catch (error) {
+    if (isCodexFirstOutputTimeout(error) && attempt === 0) {
+      log('codex first-output timeout; restarting app-server and retrying once', {
+        sessionName: name,
+        error: error.message || String(error),
+      });
+      codexAppServer.reset('first-output timeout');
+      updateSessionFields(name, { threadId: null, state: 'stopped', updatedAt: now() });
+      return runCodexAppServerTurn(name, text, opts, attempt + 1);
+    }
+    throw error;
+  }
+}
+
+const codexExecBackend = {
+  async ensure(name) {
+    updateSessionState(name, 'running');
+  },
+  async run(name, text) {
+    const start = Date.now();
+    const session = getSession(name);
+    const cwd = session.cwd || cfg.defaultWorkdir;
+    const output = await runCodexExec(text, { cwd });
+    updateSessionFields(name, {
+      state: 'running',
+      lastOutput: output,
+      lastBackend: 'codex-exec',
+      updatedAt: now(),
+    });
+    return {
+      output,
+      elapsedMs: Date.now() - start,
+      stable: true,
+      backendName: 'codex-exec',
+    };
+  },
+  async capture(name) {
+    const session = getSession(name);
+    return [
+      `session: ${name}`,
+      `backend: codex-exec`,
+      `cwd: ${session.cwd || cfg.defaultWorkdir}`,
+      '',
+      session.lastOutput || '(no last output)',
+    ].join('\n');
+  },
+  async status(name) {
+    const session = getSession(name);
+    return [
+      `session: ${name}`,
+      `backend: codex-exec`,
+      `cwd: ${session.cwd || cfg.defaultWorkdir}`,
+      `model: ${cfg.codexModel || '(Codex default)'}`,
+      `effort: ${cfg.codexReasoningEffort || '(default)'}`,
+      `sandbox: danger-full-access`,
+      `updated: ${session.updatedAt || '-'}`,
+    ].join('\n');
+  },
+  async interrupt() {},
+  async stop(name) {
+    updateSessionFields(name, { state: 'stopped', updatedAt: now() });
+  },
+  async restart(name) {
+    updateSessionFields(name, { state: 'stopped', updatedAt: now() });
+  },
+};
+
+function runCodexExec(prompt, { cwd }) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(LOG_DIR, `codex-exec-${Date.now()}-${process.pid}.txt`);
+    const args = [
+      'exec',
+      '-C',
+      cwd,
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--output-last-message',
+      outputPath,
+      ...buildCodexCliConfigArgs(cfg),
+      '-',
+    ];
+    log('starting codex exec', { cwd });
+    const child = spawn(cfg.codexPath, args, {
+      cwd,
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`Codex exec timed out after ${cfg.codexExecTimeoutMs}ms`));
+    }, cfg.codexExecTimeoutMs);
+
+    child.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      const final = readTextIfExists(outputPath).trim() || stdout.trim();
+      try { fs.unlinkSync(outputPath); } catch {}
+      if (stderr.trim()) log('[codex exec stderr]', { stderr: stderr.trim().slice(-4000) });
+      if (code !== 0) {
+        reject(new Error(`Codex exec failed: ${signal || code}; ${stderr.trim().slice(-1000)}`));
+        return;
+      }
+      resolve(final);
+    });
+    child.stdin.end(prompt);
+  });
+}
+
+function readTextIfExists(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function permissionApprovalResponse() {
+  if (!cfg.codexAutoApproveRequests) {
+    return { permissions: {}, scope: 'turn' };
+  }
+  return {
+    permissions: {
+      fileSystem: {
+        entries: [
+          {
+            access: 'write',
+            path: { type: 'special', value: { kind: 'root' } },
+          },
+        ],
+      },
+      network: { enabled: true },
+    },
+    scope: 'session',
+  };
+}
 
 const tmuxBackend = {
   async ensure(name) {
@@ -1277,14 +1773,32 @@ function hasTmuxSession(tmuxSession) {
 
 function buildPrompt(event, content, sessionName, inboxDir) {
   const lines = [
-    `飞书远程消息。session=${sessionName}`,
-    `sender=${event.sender_id || ''}`,
-    `chat=${event.chat_id || ''}`,
-    inboxDir ? `inbox=${inboxDir}` : '',
+    '[Feishu inbound message]',
+    `session: ${sessionName}`,
+    `sender_open_id: ${event.sender_id || ''}`,
+    `chat_id: ${event.chat_id || ''}`,
+    inboxDir ? `inbox_dir: ${inboxDir}` : '',
     '',
+    '[Router reply contract]',
+    'Reply to this inbound message by returning final assistant text only. The router will send that text back to Feishu.',
+    'Do not call lark-cli, Feishu/Lark APIs, or any Feishu skill/tool to reply, update, delete, or react to this triggering message.',
+    'Use Feishu tools only when the user explicitly asks for a separate Feishu side effect, such as sending a new message to another person/chat, searching chat history, or uploading a file. If you perform such a side effect, report the result in your final assistant text.',
+    '',
+    '[User message]',
     String(content).trim(),
   ].filter((line) => line !== '');
-  return lines.join(' | ');
+  return lines.join('\n');
+}
+
+function bridgeDeveloperInstructions() {
+  return [
+    'You are connected to Feishu through feishu-agent-router.',
+    'The router owns transport duties for the current inbound message: routing, deduplication, streaming cards, final reply delivery, and audit logging.',
+    'For ordinary conversation, do not send, reply, update, delete, or react to the current Feishu message yourself. Do not call lark-cli or Feishu/Lark tools just to answer the current message.',
+    'Your normal job is to return the final assistant text; feishu-agent-router will deliver it to Feishu.',
+    'You may use Feishu/Lark tools only when the user explicitly requests a separate Feishu action, for example sending a new message to another recipient/chat, reading chat history, uploading/downloading files, or managing Feishu resources.',
+    'If you perform an explicit Feishu side effect, keep the final assistant text concise and describe what you did.',
+  ].join('\n');
 }
 
 function createInboxEntry(event, normalized) {
@@ -1365,10 +1879,15 @@ function createReaction(messageId, emojiType, phase) {
   log('reaction created', { messageId, emojiType, phase });
 }
 
-function createStreamingReplyController(parentMessageId, inputText) {
+function createStreamingReplyController(parentMessageId, inputText, options = {}) {
   if (!parentMessageId || cfg.feishuStreamingMode === 'off') return null;
   const immediate = cfg.feishuStreamingMode === 'always';
-  const likelyLong = immediate || likelyNeedsStreaming(inputText);
+  const coldStart = Boolean(options.coldStart);
+  const startDelayMs = coldStart
+    ? Math.min(cfg.coldStartCardDelayMs, cfg.feishuStreamStartDelayMs)
+    : cfg.feishuStreamStartDelayMs;
+  const pendingText = coldStart ? '正在连接 Codex...' : '正在处理...';
+  const likelyLong = immediate || coldStart || likelyNeedsStreaming(inputText);
   let result = null;
   let started = false;
   let closed = false;
@@ -1376,14 +1895,14 @@ function createStreamingReplyController(parentMessageId, inputText) {
   let lastText = '';
   const startedAt = Date.now();
   const timer = likelyLong && !immediate
-    ? setTimeout(() => ensureStarted(lastText || '正在处理...'), cfg.feishuStreamStartDelayMs)
+    ? setTimeout(() => ensureStarted(lastText || pendingText), startDelayMs)
     : null;
   timer?.unref?.();
 
   function shouldStart(body) {
     if (closed || started) return false;
     if (immediate) return true;
-    if (Date.now() - startedAt < cfg.feishuStreamStartDelayMs) return false;
+    if (Date.now() - startedAt < startDelayMs) return false;
     if (likelyLong) return true;
     return body.length >= cfg.feishuStreamMinChars || hasComplexMarkdown(body);
   }
@@ -1391,7 +1910,7 @@ function createStreamingReplyController(parentMessageId, inputText) {
   function ensureStarted(seedText) {
     if (closed) return false;
     if (started) return true;
-    const body = trimReply(seedText || '正在处理...');
+    const body = trimReply(seedText || pendingText);
     if (!shouldStart(body)) return false;
     const initial = buildStreamingCardContent(body);
     const sent = sendReplyPayload(parentMessageId, initial);
@@ -1447,6 +1966,13 @@ function createStreamingReplyController(parentMessageId, inputText) {
         deleteMessage(result.messageId);
       }
       return patched.ok;
+    },
+    discard() {
+      if (closed) return false;
+      closed = true;
+      if (timer) clearTimeout(timer);
+      if (started && result?.messageId) deleteMessage(result.messageId);
+      return true;
     },
   };
 }
@@ -1728,47 +2254,192 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function allocatePort() {
-  const server = net.createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = server.address().port;
-  server.close();
-  return port;
+function unixSocketPath(listenUrl) {
+  if (!listenUrl.startsWith('unix://')) {
+    throw new Error(`Not a unix socket URL: ${listenUrl}`);
+  }
+  const rawPath = listenUrl.slice('unix://'.length);
+  if (!rawPath) return path.join(LOG_DIR, 'codex-app-server.sock');
+  return rawPath.startsWith('/') ? rawPath : path.resolve(ROOT, rawPath);
 }
 
-async function waitForWebSocket(url, timeoutMs) {
+async function connectUnixWebSocket(socketPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
     try {
-      const ws = new WebSocket(url);
-      await waitForWebSocketOpen(ws, 500);
-      ws.close();
-      return;
+      return await openUnixWebSocket(socketPath, Math.max(1, Math.min(1000, deadline - Date.now())));
     } catch (error) {
       lastError = error;
       await sleep(150);
     }
   }
-  throw new Error(`Codex app-server did not become ready: ${lastError?.message || lastError || 'timeout'}`);
+  throw new Error(`Codex app-server unix socket did not become ready: ${lastError?.message || lastError || 'timeout'}`);
 }
 
-function waitForWebSocketOpen(ws, timeoutMs) {
+function openUnixWebSocket(socketPath, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try { ws.close(); } catch {}
-      reject(new Error('websocket open timeout'));
-    }, timeoutMs);
-    ws.addEventListener('open', () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-    ws.addEventListener('error', (error) => {
-      clearTimeout(timer);
+    const socket = net.createConnection(socketPath);
+    const key = crypto.randomBytes(16).toString('base64');
+    let chunks = [];
+    let totalLength = 0;
+    let done = false;
+
+    let cleanup = () => {};
+    const fail = (error) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      socket.destroy();
       reject(error);
-    }, { once: true });
+    };
+    const onError = (error) => fail(error);
+    const onData = (chunk) => {
+      chunks.push(chunk);
+      totalLength += chunk.length;
+      const buffer = Buffer.concat(chunks, totalLength);
+      const headerEnd = buffer.indexOf('\r\n\r\n');
+      if (headerEnd < 0) return;
+
+      const header = buffer.slice(0, headerEnd).toString('utf8');
+      const status = header.split(/\r?\n/, 1)[0] || '';
+      if (!/^HTTP\/1\.[01] 101\b/.test(status)) {
+        fail(new Error(`unix websocket upgrade failed: ${status || header.slice(0, 120)}`));
+        return;
+      }
+      const accept = header.match(/^Sec-WebSocket-Accept:\s*(.+)$/im)?.[1]?.trim();
+      const expected = crypto
+        .createHash('sha1')
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest('base64');
+      if (accept && accept !== expected) {
+        fail(new Error('unix websocket upgrade returned an invalid Sec-WebSocket-Accept'));
+        return;
+      }
+
+      done = true;
+      cleanup();
+      resolve({ socket, initialData: buffer.slice(headerEnd + 4) });
+    };
+
+    const timer = setTimeout(() => {
+      fail(new Error('unix websocket connect timeout'));
+    }, timeoutMs);
+    cleanup = () => {
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('error', onError);
+    };
+
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('connect', () => {
+      socket.write([
+        'GET / HTTP/1.1',
+        'Host: localhost',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+        '',
+        '',
+      ].join('\r\n'));
+    });
   });
+}
+
+function consumeWebSocketFrames(state, chunk, handlers) {
+  state.buffer = Buffer.concat([state.buffer, chunk]);
+  while (state.buffer.length >= 2) {
+    const first = state.buffer[0];
+    const second = state.buffer[1];
+    const fin = Boolean(first & 0x80);
+    const opcode = first & 0x0f;
+    const masked = Boolean(second & 0x80);
+    let payloadLength = second & 0x7f;
+    let offset = 2;
+
+    if (payloadLength === 126) {
+      if (state.buffer.length < offset + 2) return;
+      payloadLength = state.buffer.readUInt16BE(offset);
+      offset += 2;
+    } else if (payloadLength === 127) {
+      if (state.buffer.length < offset + 8) return;
+      const bigLength = state.buffer.readBigUInt64BE(offset);
+      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error('websocket frame too large');
+      }
+      payloadLength = Number(bigLength);
+      offset += 8;
+    }
+
+    const maskOffset = offset;
+    if (masked) offset += 4;
+    if (state.buffer.length < offset + payloadLength) return;
+
+    let payload = state.buffer.slice(offset, offset + payloadLength);
+    if (masked) {
+      const mask = state.buffer.slice(maskOffset, maskOffset + 4);
+      const unmasked = Buffer.alloc(payload.length);
+      for (let index = 0; index < payload.length; index++) {
+        unmasked[index] = payload[index] ^ mask[index % 4];
+      }
+      payload = unmasked;
+    }
+    state.buffer = state.buffer.slice(offset + payloadLength);
+
+    if (opcode === 0x8) {
+      handlers.onClose?.();
+      return;
+    }
+    if (opcode === 0x9) {
+      handlers.onPing?.(payload);
+      continue;
+    }
+    if (opcode === 0xA) continue;
+    if (opcode === 0x1 || opcode === 0x0) {
+      state.fragments.push(payload);
+      if (fin) {
+        const text = Buffer.concat(state.fragments).toString('utf8');
+        state.fragments = [];
+        handlers.onText(text);
+      }
+    }
+  }
+}
+
+function sendWebSocketText(socket, text) {
+  sendWebSocketFrame(socket, 0x1, Buffer.from(text, 'utf8'));
+}
+
+function sendWebSocketFrame(socket, opcode, payload) {
+  const mask = crypto.randomBytes(4);
+  const length = payload.length;
+  let header;
+  if (length <= 125) {
+    header = Buffer.alloc(2 + 4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | length;
+    mask.copy(header, 2);
+  } else if (length <= 0xffff) {
+    header = Buffer.alloc(4 + 4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(length, 2);
+    mask.copy(header, 4);
+  } else {
+    header = Buffer.alloc(10 + 4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+    mask.copy(header, 10);
+  }
+
+  const masked = Buffer.alloc(length);
+  for (let index = 0; index < length; index++) {
+    masked[index] = payload[index] ^ mask[index % 4];
+  }
+  socket.write(Buffer.concat([header, masked]));
 }
 
 function sleepSync(ms) {

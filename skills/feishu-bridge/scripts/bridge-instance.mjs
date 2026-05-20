@@ -135,7 +135,7 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
       `codex --no-alt-screen --cd ${shellQuote(workdir)} --sandbox danger-full-access -a never`,
     ),
     FTB_CODEX_PATH: optionOrEnv('codexPath', 'FTB_CODEX_PATH', 'codex'),
-    FTB_CODEX_APP_SERVER_PORT: optionOrEnv('codexAppServerPort', 'FTB_CODEX_APP_SERVER_PORT', ''),
+    FTB_CODEX_APP_SERVER_LISTEN: optionOrEnv('codexAppServerListen', 'FTB_CODEX_APP_SERVER_LISTEN', 'stdio://'),
     FTB_CODEX_PROFILE: optionOrEnv('codexProfile', 'FTB_CODEX_PROFILE', ''),
     FTB_CODEX_MODEL: optionOrEnv('codexModel', 'FTB_CODEX_MODEL', ''),
     FTB_CODEX_MODEL_PROVIDER: optionOrEnv('codexModelProvider', 'FTB_CODEX_MODEL_PROVIDER', ''),
@@ -145,11 +145,21 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_CODEX_APPROVAL_POLICY: optionOrEnv('codexApprovalPolicy', 'FTB_CODEX_APPROVAL_POLICY', 'never'),
     FTB_CODEX_NETWORK_ACCESS: optionOrEnv('codexNetworkAccess', 'FTB_CODEX_NETWORK_ACCESS', 'true'),
     FTB_CODEX_AUTO_APPROVE_REQUESTS: optionOrEnv('codexAutoApproveRequests', 'FTB_CODEX_AUTO_APPROVE_REQUESTS', 'true'),
+    FTB_CODEX_RESPONSES_WEBSOCKETS: optionOrEnv('codexResponsesWebSockets', 'FTB_CODEX_RESPONSES_WEBSOCKETS', 'false'),
+    FTB_CODEX_FORCE_RESPONSES_HTTP: optionOrEnv('codexForceResponsesHttp', 'FTB_CODEX_FORCE_RESPONSES_HTTP', 'true'),
+    FTB_CODEX_HTTP_PROVIDER_ID: optionOrEnv('codexHttpProviderId', 'FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
+    FTB_CODEX_HTTP_PROVIDER_NAME: optionOrEnv('codexHttpProviderName', 'FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
+    FTB_CODEX_HTTP_PROVIDER_BASE_URL: optionOrEnv('codexHttpProviderBaseUrl', 'FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
+    FTB_PREWARM_CODEX: optionOrEnv('prewarmCodex', 'FTB_PREWARM_CODEX', 'true'),
+    FTB_PREWARM_SESSIONS: optionOrEnv('prewarmSessions', 'FTB_PREWARM_SESSIONS', 'main'),
+    FTB_PREWARM_TURN: optionOrEnv('prewarmTurn', 'FTB_PREWARM_TURN', 'false'),
     FTB_CODEX_REQUEST_TIMEOUT_MS: optionOrEnv('codexRequestTimeoutMs', 'FTB_CODEX_REQUEST_TIMEOUT_MS', '120000'),
     FTB_CODEX_START_TIMEOUT_MS: optionOrEnv('codexStartTimeoutMs', 'FTB_CODEX_START_TIMEOUT_MS', '8000'),
+    FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS: optionOrEnv('codexFirstOutputTimeoutMs', 'FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', '90000'),
     FTB_FEISHU_RICH_REPLIES: optionOrEnv('feishuRichReplies', 'FTB_FEISHU_RICH_REPLIES', 'true'),
     FTB_FEISHU_REACTIONS: optionOrEnv('feishuReactions', 'FTB_FEISHU_REACTIONS', 'true'),
     FTB_FEISHU_STREAMING: optionOrEnv('feishuStreaming', 'FTB_FEISHU_STREAMING', 'auto'),
+    FTB_COLD_START_CARD_DELAY_MS: optionOrEnv('coldStartCardDelayMs', 'FTB_COLD_START_CARD_DELAY_MS', '1500'),
     FTB_FEISHU_STREAM_START_DELAY_MS: optionOrEnv('feishuStreamStartDelayMs', 'FTB_FEISHU_STREAM_START_DELAY_MS', '5000'),
     FTB_FEISHU_STREAM_MIN_CHARS: optionOrEnv('feishuStreamMinChars', 'FTB_FEISHU_STREAM_MIN_CHARS', '240'),
     FTB_FEISHU_STREAM_PATCH_MS: optionOrEnv('feishuStreamPatchMs', 'FTB_FEISHU_STREAM_PATCH_MS', '2000'),
@@ -370,7 +380,7 @@ function optionKey(raw) {
     workdir: 'workdir',
     'agent-cmd': 'agentCmd',
     'codex-path': 'codexPath',
-    'codex-port': 'codexAppServerPort',
+    'codex-listen': 'codexAppServerListen',
     'codex-profile': 'codexProfile',
     'codex-model': 'codexModel',
     'codex-model-provider': 'codexModelProvider',
@@ -380,11 +390,21 @@ function optionKey(raw) {
     'approval-policy': 'codexApprovalPolicy',
     'network-access': 'codexNetworkAccess',
     'auto-approve-requests': 'codexAutoApproveRequests',
+    'responses-websockets': 'codexResponsesWebSockets',
+    'force-responses-http': 'codexForceResponsesHttp',
+    'http-provider-id': 'codexHttpProviderId',
+    'http-provider-name': 'codexHttpProviderName',
+    'http-provider-base-url': 'codexHttpProviderBaseUrl',
+    'prewarm-codex': 'prewarmCodex',
+    'prewarm-sessions': 'prewarmSessions',
+    'prewarm-turn': 'prewarmTurn',
     'request-timeout-ms': 'codexRequestTimeoutMs',
     'start-timeout-ms': 'codexStartTimeoutMs',
+    'first-output-timeout-ms': 'codexFirstOutputTimeoutMs',
     'rich-replies': 'feishuRichReplies',
     reactions: 'feishuReactions',
     streaming: 'feishuStreaming',
+    'cold-start-card-delay-ms': 'coldStartCardDelayMs',
     'stream-start-delay-ms': 'feishuStreamStartDelayMs',
     'stream-min-chars': 'feishuStreamMinChars',
     'stream-patch-ms': 'feishuStreamPatchMs',
@@ -453,6 +473,9 @@ Core options:
   --admin-users IDS           Comma-separated admin user IDs
   --workdir DIR               Default agent working directory
   --agent-cmd CMD             tmux fallback command
+  --codex-listen URL          Codex app-server transport: stdio:// or unix://PATH
+  --force-responses-http BOOL Force Codex provider wire_api="responses"
+  --prewarm-sessions NAMES    Comma-separated Codex sessions to prewarm
   --set FTB_KEY=VALUE         Override a generated FTB_* value
   --force                     Rewrite existing env on init
   --dry-run                   Print farctl invocation without running it
