@@ -73,7 +73,7 @@ const cfg = {
   codexSandbox: env('FTB_CODEX_SANDBOX', 'danger-full-access'),
   codexApprovalPolicy: env('FTB_CODEX_APPROVAL_POLICY', 'never'),
   codexNetworkAccess: boolEnv('FTB_CODEX_NETWORK_ACCESS', true),
-  codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', false),
+  codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', true),
   feishuRichReplies: boolEnv('FTB_FEISHU_RICH_REPLIES', true),
   feishuReactions: boolEnv('FTB_FEISHU_REACTIONS', true),
   feishuStreaming: boolEnv('FTB_FEISHU_STREAMING', true),

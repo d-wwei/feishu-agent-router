@@ -211,6 +211,23 @@ message as a structured `turn/start` request. The session stores the Codex
 `threadId`, so future messages resume the same Codex thread without parsing a
 terminal screen.
 
+By default, the Codex backend is configured for remote-office control:
+
+```text
+FTB_CODEX_SANDBOX=danger-full-access
+FTB_CODEX_APPROVAL_POLICY=never
+FTB_CODEX_AUTO_APPROVE_REQUESTS=true
+```
+
+The tmux fallback command also defaults to:
+
+```text
+codex --no-alt-screen --cd <cwd> --sandbox danger-full-access -a never
+```
+
+These defaults avoid permission prompts and sandbox blocks while controlling
+the machine from Feishu. They can be tightened in `.env` per deployment.
+
 `tmux` remains available as a fallback. If a `codex-app-server` session fails
 and the session does not set `"fallback": false`, the router sends the same
 prompt to the session's `tmuxSession` and replies with the tmux result.
