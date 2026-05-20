@@ -41,7 +41,29 @@ test('extractFileKey accepts known key spellings', () => {
   assert.equal(extractFileKey('{"image_key":"img_a"}'), 'img_a');
   assert.equal(extractFileKey('{"fileKey":"file_a"}'), 'file_a');
   assert.equal(extractFileKey('{"video_key":"vid_a"}'), 'vid_a');
+  assert.equal(extractFileKey('<file key="file_v3_0011s_abc" name="测试账号(1).rtf"/>'), 'file_v3_0011s_abc');
   assert.equal(extractFileKey('not-json'), null);
+});
+
+test('normalizeInboundEvent builds download plans for file tag content', () => {
+  const normalized = normalizeInboundEvent({
+    message_id: 'om_file_tag',
+    chat_id: 'oc1',
+    sender_id: 'ou1',
+    message_type: 'file',
+    content: '<file key="file_v3_0011s_abc" name="测试账号(1).rtf"/>',
+  });
+
+  assert.equal(normalized.text, '[文件: file_v3_0011s_abc]');
+  assert.deepEqual(normalized.downloadPlans, [{
+    messageId: 'om_file_tag',
+    fileKey: 'file_v3_0011s_abc',
+    messageType: 'file',
+    resourceType: 'file',
+    label: 'file',
+    suggestedName: '测试账号(1).rtf',
+  }]);
+  assert.deepEqual(normalized.unsupportedReasons, []);
 });
 
 test('stripMentionMarkers removes Feishu mention placeholders', () => {
@@ -130,19 +152,45 @@ test('buildLarkCliResourceDownloadArgs can pin a lark profile', () => {
 
 test('createInboxEntryLike writes normalized materials and manifest', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-ingest-'));
+  const calls = [];
   const entry = createInboxEntryLike(
     {
       message_id: 'om_file',
       chat_id: 'oc1',
       sender_id: 'ou1',
       message_type: 'file',
-      content: '{"file_key":"file_123"}',
+      content: '<file key="file_v3_0011s_abc" name="测试账号(1).rtf"/>',
     },
-    { inboxRoot: root, now: new Date('2026-05-20T00:00:00Z') },
+    {
+      inboxRoot: root,
+      now: new Date('2026-05-20T00:00:00Z'),
+      download: true,
+      spawnSync(command, args) {
+        calls.push({ command, args });
+        return { status: 0, signal: null, stdout: '{"ok":true}', stderr: '' };
+      },
+    },
   );
 
   assert.equal(entry.manifest.messageId, 'om_file');
-  assert.equal(entry.manifest.downloadPlans[0].fileKey, 'file_123');
+  assert.equal(entry.manifest.downloadPlans[0].fileKey, 'file_v3_0011s_abc');
+  assert.equal(entry.manifest.downloadPlans[0].suggestedName, '测试账号(1).rtf');
+  assert.equal(entry.manifest.downloads.length, 1);
+  assert.equal(calls[0].command, 'lark-cli');
+  assert.deepEqual(calls[0].args, [
+    'im',
+    '+messages-resources-download',
+    '--as',
+    'bot',
+    '--message-id',
+    'om_file',
+    '--file-key',
+    'file_v3_0011s_abc',
+    '--type',
+    'file',
+    '--output',
+    '测试账号_1_.rtf',
+  ]);
   assert.ok(fs.existsSync(path.join(entry.dir, 'content.md')));
   assert.ok(fs.existsSync(path.join(entry.dir, 'manifest.json')));
 });
