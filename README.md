@@ -181,10 +181,12 @@ Phase 1: router MVP
 
 Phase 2: office materials
 
+- Inbound text/post/image/file/video/merge-forward messages are normalized
 - Non-text and `/file` messages are saved under `inbox/`
 - `message.json`, `content.md`, and `manifest.json` are created
-- The router tries Feishu official resource download for image/file attachments
+- The router tries Feishu official resource download for image/file/video attachments
 - Local inbox paths are passed to the backend session
+- Voice transcription is intentionally not included in this phase
 
 Phase 3: multi-agent routing
 
@@ -193,6 +195,13 @@ Phase 3: multi-agent routing
 - The tmux backend can start any command and is used as fallback when app-server fails
 - Feishu chats/users/threads can map to different sessions
 - Optional idle auto-stop is available via `FTB_IDLE_STOP_MS` and per-session `"idleStop": true`
+
+Feishu UX migration:
+
+- Replies use Feishu post messages for normal markdown and interactive cards for code blocks/tables
+- Message reactions are added as best-effort phase feedback when the bot has reaction permission
+- Permission cards can be rendered, but button callback handling is not wired until the active `lark-cli` event catalog exposes card action events; text fallback commands remain the safe path
+- Streaming replies are sent as an initial interactive card and patched in place; if card send/patch fails, the router falls back to the normal final reply
 
 ## Backends
 

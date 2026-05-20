@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node bin/bridge.mjs",
     "doctor": "node bin/doctor.mjs",
-    "check": "node --check bin/bridge.mjs && node --check bin/doctor.mjs && node --check bin/farctl.mjs",
+    "check": "node --check bin/bridge.mjs && node --check bin/doctor.mjs && node --check bin/farctl.mjs && node --check lib/feishu-render.mjs && node --check lib/feishu-ingest.mjs && node --check lib/feishu-interactions.mjs",
+    "test": "node --test",
     "service": "node bin/farctl.mjs"
   },
   "bin": {

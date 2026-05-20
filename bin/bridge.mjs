@@ -6,6 +6,20 @@ import net from 'node:net';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import {
+  createInboxEntryLike,
+  normalizeInboundEvent,
+} from '../lib/feishu-ingest.mjs';
+import {
+  buildFinalCardContent,
+  buildMessageContent,
+  buildStreamingCardContent,
+} from '../lib/feishu-render.mjs';
+import {
+  buildReactionCreateArgv,
+  pickPhase1Emoji,
+  pickPhase2Emojis,
+} from '../lib/feishu-interactions.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -60,6 +74,10 @@ const cfg = {
   codexApprovalPolicy: env('FTB_CODEX_APPROVAL_POLICY', 'never'),
   codexNetworkAccess: boolEnv('FTB_CODEX_NETWORK_ACCESS', true),
   codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', false),
+  feishuRichReplies: boolEnv('FTB_FEISHU_RICH_REPLIES', true),
+  feishuReactions: boolEnv('FTB_FEISHU_REACTIONS', true),
+  feishuStreaming: boolEnv('FTB_FEISHU_STREAMING', true),
+  feishuStreamPatchMs: intEnv('FTB_FEISHU_STREAM_PATCH_MS', 2_000),
 };
 
 let state = loadState();
@@ -245,8 +263,9 @@ function startEventConsumer() {
 
 async function handleEvent(event) {
   reloadState();
-  const messageId = event.message_id || event.id;
-  const dedupKey = event.event_id || messageId;
+  const normalized = normalizeInboundEvent(event);
+  const messageId = normalized.messageId || event.message_id || event.id;
+  const dedupKey = normalized.eventId || event.event_id || messageId;
   if (!messageId || !dedupKey) return;
   if (state.seen.includes(dedupKey)) {
     log(`dedup skip`, { messageId });
@@ -265,13 +284,18 @@ async function handleEvent(event) {
     return;
   }
 
-  const content = String(event.content || '').trim();
-  audit('inbound', event, { content: content.slice(0, 500), messageType: event.message_type });
+  const content = normalized.text || String(event.content || '').trim();
+  audit('inbound', event, {
+    content: content.slice(0, 500),
+    messageType: normalized.messageType,
+    downloadPlans: normalized.downloadPlans.length,
+    mergeForward: normalized.mergeForward?.status || '',
+  });
   log(`received message`, {
     messageId,
     sender: shortId(event.sender_id),
     chat: shortId(event.chat_id),
-    type: event.message_type,
+    type: normalized.messageType,
     content: content.slice(0, 80),
   });
 
@@ -290,7 +314,10 @@ async function handleEvent(event) {
     return;
   }
 
-  await sendToResolvedSession(event, content, { saveInbox: event.message_type !== 'text' });
+  await sendToResolvedSession(event, content, {
+    normalized,
+    saveInbox: shouldSaveInbox(normalized),
+  });
 }
 
 function isAllowed(event) {
@@ -310,6 +337,14 @@ function isCommand(content) {
 
 function shouldIgnorePlainMessage(event) {
   return cfg.groupRequireCommand && event.chat_type === 'group';
+}
+
+function shouldSaveInbox(normalized) {
+  if (!normalized) return false;
+  if (normalized.messageType !== 'text') return true;
+  if (normalized.downloadPlans.length > 0) return true;
+  if (normalized.mergeForward) return true;
+  return false;
 }
 
 async function handleCommand(event, content) {
@@ -515,15 +550,22 @@ async function sendToResolvedSession(event, content, opts = {}) {
 async function sendToSession(event, sessionName, content, opts = {}) {
   const session = getSession(sessionName);
   const backend = backendFor(session);
-  const inbox = opts.saveInbox ? createInboxEntry(event) : null;
+  const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
   const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
-  const result = await runSessionWithFallback(sessionName, backend, prompt);
+  await maybeReactPhase1(event, content);
+  const stream = cfg.feishuStreaming ? startStreamingReply(event.message_id || event.id) : null;
+  const result = await runSessionWithFallback(sessionName, backend, prompt, {
+    onDelta: (deltaText) => stream?.update(deltaText),
+  });
   const { output, elapsedMs, stable, backendName, fallbackReason } = result;
   log('session turn completed', { sessionName, backend: backendName, elapsedMs, stable, fallback: Boolean(fallbackReason) });
   const text = output.trim()
     ? formatSessionReply(output, result)
     : `已投递到 ${sessionName}，但 ${Math.round(cfg.maxWaitMs / 1000)}s 内没有捕获到新输出。`;
-  await reply(event.message_id || event.id, stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`);
+  const finalText = stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`;
+  const streamDelivered = stream?.finish(finalText) || false;
+  if (!streamDelivered) await reply(event.message_id || event.id, finalText);
+  await maybeReactPhase2(event, content, text);
 }
 
 function formatSessionReply(output, result) {
@@ -537,14 +579,14 @@ function formatSessionReply(output, result) {
   ].join('\n');
 }
 
-async function runSessionWithFallback(sessionName, backend, prompt) {
+async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
   try {
-    return await backend.run(sessionName, prompt);
+    return await backend.run(sessionName, prompt, opts);
   } catch (error) {
     const session = getSession(sessionName);
     if (session.backend !== 'codex-app-server' || session.fallback === false) throw error;
     log('codex app-server failed; falling back to tmux', { sessionName, error: error.message || String(error) });
-    const result = await tmuxBackend.run(sessionName, prompt);
+    const result = await tmuxBackend.run(sessionName, prompt, opts);
     return {
       ...result,
       backendName: 'tmux',
@@ -697,7 +739,7 @@ class CodexAppServerClient {
     return result;
   }
 
-  async turnStart(params) {
+  async turnStart(params, opts = {}) {
     const result = await this.request('turn/start', params);
     const turnId = result.turn.id;
     return new Promise((resolve, reject) => {
@@ -706,6 +748,7 @@ class CodexAppServerClient {
         text: '',
         final: '',
         lastError: null,
+        onDelta: opts.onDelta,
         resolve,
         reject,
       });
@@ -783,7 +826,16 @@ class CodexAppServerClient {
   handleNotification(msg) {
     if (msg.method === 'item/agentMessage/delta') {
       const turn = this.turns.get(msg.params.turnId);
-      if (turn) turn.text += msg.params.delta || '';
+      if (turn) {
+        turn.text += msg.params.delta || '';
+        if (typeof turn.onDelta === 'function') {
+          try {
+            turn.onDelta(turn.text);
+          } catch (error) {
+            log('delta observer failed', { error: error.message || String(error) });
+          }
+        }
+      }
       return;
     }
     if (msg.method === 'item/completed') {
@@ -869,7 +921,7 @@ const codexAppServerBackend = {
     await codexAppServer.ensureReady();
     updateSessionState(name, 'running');
   },
-  async run(name, text) {
+  async run(name, text, opts = {}) {
     const start = Date.now();
     const threadId = await ensureCodexThread(name);
     const output = await codexAppServer.turnStart({
@@ -879,7 +931,7 @@ const codexAppServerBackend = {
       approvalPolicy: cfg.codexApprovalPolicy,
       ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
       ...(cfg.codexReasoningEffort ? { effort: cfg.codexReasoningEffort } : {}),
-    });
+    }, opts);
     updateSessionFields(name, {
       state: 'running',
       lastOutput: output,
@@ -1082,55 +1134,224 @@ function buildPrompt(event, content, sessionName, inboxDir) {
   return lines.join(' | ');
 }
 
-function createInboxEntry(event) {
-  const messageId = event.message_id || event.id || `event-${Date.now()}`;
-  const date = new Date().toISOString().slice(0, 10);
-  const dir = path.join(INBOX_DIR, date, messageId);
-  const attachmentsDir = path.join(dir, 'attachments');
-  fs.mkdirSync(attachmentsDir, { recursive: true });
-  writeJson(path.join(dir, 'message.json'), event);
-  fs.writeFileSync(path.join(dir, 'content.md'), String(event.content || '').trim() + '\n');
-
+function createInboxEntry(event, normalized) {
+  const entry = createInboxEntryLike(event, {
+    inboxRoot: INBOX_DIR,
+    larkAs: cfg.larkAs,
+    download: true,
+  });
+  const effective = normalized || entry.normalized;
   const manifest = {
-    messageId,
-    chatId: event.chat_id,
-    senderId: event.sender_id,
-    messageType: event.message_type,
-    createdAt: now(),
-    attachments: [],
-    downloadErrors: [],
+    ...entry.manifest,
+    attachments: entry.manifest.downloads || [],
+    genericDownloadFallbacks: [],
   };
 
-  for (const type of ['image', 'file']) {
-    const result = spawnSync(
-      'lark-cli',
-      ['im', '+messages-resources-download', '--as', cfg.larkAs, '--message-id', messageId, '--type', type],
-      { cwd: attachmentsDir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-    );
-    if (result.status === 0) {
-      manifest.attachments.push({ type, stdout: result.stdout.trim() });
-    } else {
-      manifest.downloadErrors.push({ type, stderr: result.stderr.trim(), stdout: result.stdout.trim() });
+  if (needsGenericDownloadFallback(effective, manifest)) {
+    for (const type of genericResourceTypes(effective.messageType)) {
+      const result = spawnSync(
+        'lark-cli',
+        ['im', '+messages-resources-download', '--as', cfg.larkAs, '--message-id', effective.messageId, '--type', type],
+        { cwd: entry.attachmentsDir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+      );
+      const record = { type, stdout: result.stdout.trim(), stderr: result.stderr.trim(), status: result.status };
+      if (result.status === 0) manifest.genericDownloadFallbacks.push(record);
+      else manifest.downloadErrors.push(record);
     }
   }
 
-  writeJson(path.join(dir, 'manifest.json'), manifest);
-  return { dir, manifest };
+  writeJson(path.join(entry.dir, 'manifest.json'), manifest);
+  return { ...entry, manifest };
+}
+
+function needsGenericDownloadFallback(normalized, manifest) {
+  if (!normalized?.messageId) return false;
+  if (!['image', 'file', 'video'].includes(normalized.messageType)) return false;
+  return (manifest.downloads?.length || 0) === 0 && (manifest.genericDownloadFallbacks?.length || 0) === 0;
+}
+
+function genericResourceTypes(messageType) {
+  if (messageType === 'image') return ['image'];
+  if (messageType === 'file' || messageType === 'video') return ['file'];
+  return [];
+}
+
+async function maybeReactPhase1(event, content) {
+  if (!cfg.feishuReactions) return;
+  const emojiType = pickPhase1Emoji(content);
+  if (!emojiType) return;
+  createReaction(event.message_id || event.id, emojiType, 'phase1');
+}
+
+async function maybeReactPhase2(event, content, response) {
+  if (!cfg.feishuReactions) return;
+  for (const emojiType of pickPhase2Emojis(content, response)) {
+    createReaction(event.message_id || event.id, emojiType, 'phase2');
+  }
+}
+
+function createReaction(messageId, emojiType, phase) {
+  if (!messageId || !emojiType) return;
+  const args = buildReactionCreateArgv({ messageId, emojiType, larkAs: cfg.larkAs });
+  const result = spawnSync('lark-cli', args, {
+    encoding: 'utf8',
+    cwd: ROOT,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    log('reaction failed', {
+      messageId,
+      emojiType,
+      phase,
+      stderr: result.stderr.trim(),
+      stdout: result.stdout.trim(),
+    });
+    return;
+  }
+  log('reaction created', { messageId, emojiType, phase });
+}
+
+function startStreamingReply(parentMessageId) {
+  if (!parentMessageId) return null;
+  const initial = buildStreamingCardContent('正在处理...');
+  const result = sendReplyPayload(parentMessageId, initial);
+  if (!result.ok || !result.messageId) {
+    log('streaming reply start failed', {
+      parentMessageId,
+      stderr: result.stderr || '',
+      stdout: result.stdout || '',
+    });
+    return null;
+  }
+
+  let lastPatchAt = 0;
+  let lastText = '';
+  let closed = false;
+
+  return {
+    update(text) {
+      if (closed) return false;
+      const body = trimReply(text);
+      if (!body || body === lastText || body === '(empty)') return true;
+      const nowMs = Date.now();
+      if (nowMs - lastPatchAt < cfg.feishuStreamPatchMs) return true;
+      lastPatchAt = nowMs;
+      lastText = body;
+      const payload = buildStreamingCardContent(body);
+      const patched = patchMessagePayload(result.messageId, payload);
+      if (!patched.ok) {
+        log('streaming reply patch failed', {
+          messageId: result.messageId,
+          stderr: patched.stderr,
+          stdout: patched.stdout,
+        });
+      }
+      return patched.ok;
+    },
+    finish(text) {
+      if (closed) return false;
+      closed = true;
+      const payload = buildFinalCardContent(trimReply(text));
+      const patched = patchMessagePayload(result.messageId, payload);
+      if (!patched.ok) {
+        log('streaming reply final patch failed', {
+          messageId: result.messageId,
+          stderr: patched.stderr,
+          stdout: patched.stdout,
+        });
+        deleteMessage(result.messageId);
+      }
+      return patched.ok;
+    },
+  };
 }
 
 async function reply(messageId, text) {
-  const result = spawnSync(
+  const body = trimReply(text);
+  const rendered = cfg.feishuRichReplies ? buildMessageContent(body) : null;
+  const result = rendered
+    ? sendReplyPayload(messageId, rendered)
+    : sendTextReply(messageId, body);
+  if (result.status !== 0) {
+    log(`rich reply failed; falling back to text`, {
+      messageId,
+      msgType: rendered?.msg_type || 'text',
+      stderr: result.stderr.trim(),
+      stdout: result.stdout.trim(),
+    });
+    const fallback = sendTextReply(messageId, body);
+    if (fallback.status !== 0) {
+      log(`reply failed`, { messageId, stderr: fallback.stderr.trim(), stdout: fallback.stdout.trim() });
+      audit('reply_failed', { message_id: messageId }, { stderr: fallback.stderr.trim(), stdout: fallback.stdout.trim() });
+      return;
+    }
+  }
+  log(`replied`, { messageId, msgType: rendered?.msg_type || 'text' });
+  audit('outbound', { message_id: messageId }, { text: body.slice(0, 500), msgType: rendered?.msg_type || 'text' });
+}
+
+function sendTextReply(messageId, text) {
+  return spawnSync(
     'lark-cli',
-    ['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--text', trimReply(text)],
+    ['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--text', text],
     { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
   );
+}
+
+function sendReplyPayload(messageId, payload) {
+  const result = spawnSync(
+    'lark-cli',
+    ['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--msg-type', payload.msg_type, '--content', payload.content],
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
+  );
+  return {
+    ...result,
+    ok: result.status === 0,
+    messageId: parseReturnedMessageId(result.stdout),
+    stdout: String(result.stdout || ''),
+    stderr: String(result.stderr || ''),
+  };
+}
+
+function patchMessagePayload(messageId, payload) {
+  const result = spawnSync(
+    'lark-cli',
+    ['api', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, '--as', cfg.larkAs, '--data', JSON.stringify({ content: payload.content })],
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
+  );
+  return {
+    ok: result.status === 0,
+    status: result.status,
+    stdout: String(result.stdout || '').trim(),
+    stderr: String(result.stderr || '').trim(),
+  };
+}
+
+function deleteMessage(messageId) {
+  const result = spawnSync(
+    'lark-cli',
+    ['im', 'messages', 'delete', '--as', cfg.larkAs, '--params', JSON.stringify({ message_id: messageId })],
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 4 * 1024 * 1024 },
+  );
   if (result.status !== 0) {
-    log(`reply failed`, { messageId, stderr: result.stderr.trim(), stdout: result.stdout.trim() });
-    audit('reply_failed', { message_id: messageId }, { stderr: result.stderr.trim(), stdout: result.stdout.trim() });
-    return;
+    log('delete message failed', {
+      messageId,
+      stderr: String(result.stderr || '').trim(),
+      stdout: String(result.stdout || '').trim(),
+    });
   }
-  log(`replied`, { messageId });
-  audit('outbound', { message_id: messageId }, { text: trimReply(text).slice(0, 500) });
+}
+
+function parseReturnedMessageId(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed?.data?.message_id || parsed?.message_id || parsed?.data?.message?.message_id || null;
+  } catch {
+    const match = text.match(/om_[A-Za-z0-9_-]+/);
+    return match ? match[0] : null;
+  }
 }
 
 function audit(direction, event, extra = {}) {
