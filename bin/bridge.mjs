@@ -519,17 +519,22 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
   const result = await runSessionWithFallback(sessionName, backend, prompt);
   const { output, elapsedMs, stable, backendName, fallbackReason } = result;
+  log('session turn completed', { sessionName, backend: backendName, elapsedMs, stable, fallback: Boolean(fallbackReason) });
   const text = output.trim()
-    ? [
-      `session: ${sessionName}`,
-      `backend: ${backendName}`,
-      `用时 ${(elapsedMs / 1000).toFixed(1)}s`,
-      fallbackReason ? `fallback: ${fallbackReason}` : '',
-      '',
-      trimReply(output),
-    ].filter((line) => line !== '').join('\n')
+    ? formatSessionReply(output, result)
     : `已投递到 ${sessionName}，但 ${Math.round(cfg.maxWaitMs / 1000)}s 内没有捕获到新输出。`;
   await reply(event.message_id || event.id, stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`);
+}
+
+function formatSessionReply(output, result) {
+  const body = trimReply(output);
+  if (!result.fallbackReason) return body;
+  return [
+    body,
+    '',
+    `[fallback: ${result.backendName}; ${(result.elapsedMs / 1000).toFixed(1)}s]`,
+    result.fallbackReason,
+  ].join('\n');
 }
 
 async function runSessionWithFallback(sessionName, backend, prompt) {
