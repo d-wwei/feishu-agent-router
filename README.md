@@ -7,7 +7,7 @@ Feishu official events/messages/files
 -> local router daemon
 -> session registry and route table
 -> backend adapter
--> tmux + Codex/Claude/Gemini/script
+-> Codex app-server, or tmux fallback for terminal agents
 ```
 
 The router daemon is intentionally not an agent. It listens, checks permissions, parses commands, stores incoming materials, routes messages to sessions, captures output, and replies in Feishu.
@@ -25,7 +25,7 @@ The router uses the existing local `lark-cli` app/bot configuration. No Feishu a
 For real daily use, install it as a user launchd service:
 
 ```bash
-cd /Users/admin/Documents/AI/feishu-tmux-bridge
+cd /Users/admin/Documents/AI/feishu-agent-router
 npm link
 npm run service -- install
 npm run service -- status
@@ -132,8 +132,9 @@ Admin-only commands:
 ```json
 {
   "main": {
-    "backend": "tmux",
+    "backend": "codex-app-server",
     "agent": "codex",
+    "threadId": null,
     "tmuxSession": "far-main",
     "cwd": "/Users/admin",
     "command": "codex --no-alt-screen --cd /Users/admin --sandbox danger-full-access -a never",
@@ -175,7 +176,8 @@ Phase 1: router MVP
 - `/sessions`, `/routes`, `/whereami`, `/status`
 - `/bind`, `/use`
 - `/send`, `/capture`, `/interrupt`
-- tmux backend with persistent sessions
+- Codex app-server backend with persistent Codex threads
+- tmux backend kept as a fallback and for terminal agents
 
 Phase 2: office materials
 
@@ -187,6 +189,19 @@ Phase 2: office materials
 Phase 3: multi-agent routing
 
 - Sessions are backend/agent/command records
-- The tmux backend can start any command, not only Codex
+- Codex sessions can use `codex-app-server` and keep a `threadId`
+- The tmux backend can start any command and is used as fallback when app-server fails
 - Feishu chats/users/threads can map to different sessions
 - Optional idle auto-stop is available via `FTB_IDLE_STOP_MS` and per-session `"idleStop": true`
+
+## Backends
+
+`codex-app-server` is the preferred backend for Codex. It starts one local
+`codex app-server --listen ws://127.0.0.1:<port>` process and sends each Feishu
+message as a structured `turn/start` request. The session stores the Codex
+`threadId`, so future messages resume the same Codex thread without parsing a
+terminal screen.
+
+`tmux` remains available as a fallback. If a `codex-app-server` session fails
+and the session does not set `"fallback": false`, the router sends the same
+prompt to the session's `tmuxSession` and replies with the tmux result.

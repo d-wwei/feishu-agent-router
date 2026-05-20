@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Feishu official-events router to persistent tmux-backed agent sessions.",
+  "description": "Feishu official-events router to Codex app-server sessions with tmux fallback.",
   "scripts": {
     "start": "node bin/bridge.mjs",
     "doctor": "node bin/doctor.mjs",

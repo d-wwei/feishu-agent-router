@@ -18,6 +18,10 @@ for (const bin of bins) {
   console.log(`${found ? 'ok' : 'missing'} ${bin}${found ? ` -> ${found}` : ''}`);
 }
 
+const appServer = spawnSync('codex', ['app-server', '--help'], { encoding: 'utf8' });
+console.log(`${appServer.status === 0 ? 'ok' : 'missing'} codex app-server`);
+console.log(`${typeof WebSocket === 'function' ? 'ok' : 'missing'} node WebSocket global`);
+
 console.log(`${fs.existsSync(envPath) ? 'ok' : 'missing'} .env`);
 if (!fs.existsSync(envPath)) {
   console.log('Create it from .env.example before starting.');

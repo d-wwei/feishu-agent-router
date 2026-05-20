@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +34,7 @@ const cfg = {
   allowedChats: csvEnv('FTB_ALLOWED_CHATS'),
   adminUsers: csvEnv('FTB_ADMIN_USERS', env('FTB_ALLOWED_SENDERS', '')),
   defaultSession: env('FTB_DEFAULT_SESSION', 'main'),
+  defaultBackend: env('FTB_DEFAULT_BACKEND', 'codex-app-server'),
   defaultWorkdir: env('FTB_WORKDIR', process.env.HOME || '/tmp'),
   defaultTmuxSession: env('FTB_TMUX_SESSION', 'far-main'),
   defaultAgent: env('FTB_DEFAULT_AGENT', 'codex'),
@@ -47,6 +50,16 @@ const cfg = {
   replyMaxChars: intEnv('FTB_REPLY_MAX_CHARS', 3_500),
   restartDelayMs: intEnv('FTB_RESTART_DELAY_MS', 3_000),
   idleStopMs: intEnv('FTB_IDLE_STOP_MS', 0),
+  codexPath: env('FTB_CODEX_PATH', 'codex'),
+  codexAppServerPort: optionalIntEnv('FTB_CODEX_APP_SERVER_PORT'),
+  codexRequestTimeoutMs: intEnv('FTB_CODEX_REQUEST_TIMEOUT_MS', 120_000),
+  codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
+  codexModel: env('FTB_CODEX_MODEL', ''),
+  codexReasoningEffort: env('FTB_CODEX_REASONING_EFFORT', 'medium'),
+  codexSandbox: env('FTB_CODEX_SANDBOX', 'danger-full-access'),
+  codexApprovalPolicy: env('FTB_CODEX_APPROVAL_POLICY', 'never'),
+  codexNetworkAccess: boolEnv('FTB_CODEX_NETWORK_ACCESS', true),
+  codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', false),
 };
 
 let state = loadState();
@@ -104,6 +117,13 @@ function intEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function optionalIntEnv(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return null;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 function loadState() {
   const sessions = readJson(SESSIONS_PATH, null) || defaultSessions();
   const routes = readJson(ROUTES_PATH, null) || defaultRoutes();
@@ -123,8 +143,9 @@ function reloadState() {
 function defaultSessions() {
   return {
     [cfg.defaultSession]: {
-      backend: 'tmux',
+      backend: cfg.defaultBackend,
       agent: cfg.defaultAgent,
+      threadId: null,
       tmuxSession: cfg.defaultTmuxSession,
       cwd: cfg.defaultWorkdir,
       command: cfg.defaultCommand,
@@ -410,35 +431,37 @@ async function cmdSend(event, tokens) {
 async function cmdCapture(event, tokens) {
   const sessionName = tokens[0] || resolveSessionName(event);
   const backend = backendFor(getSession(sessionName));
-  await reply(event.message_id || event.id, trimReply(backend.capture(sessionName)));
+  await reply(event.message_id || event.id, trimReply(await backend.capture(sessionName)));
 }
 
 async function cmdStatus(event, tokens) {
   const sessionName = tokens[0] || resolveSessionName(event);
   const session = getSession(sessionName);
   const backend = backendFor(session);
-  await reply(event.message_id || event.id, backend.status(sessionName));
+  await reply(event.message_id || event.id, await backend.status(sessionName));
 }
 
 async function cmdInterrupt(event, tokens) {
   const sessionName = tokens[0] || resolveSessionName(event);
   const backend = backendFor(getSession(sessionName));
-  backend.interrupt(sessionName);
+  await backend.interrupt(sessionName);
   await reply(event.message_id || event.id, `已中断 session: ${sessionName}`);
 }
 
 async function cmdNew(event, tokens) {
   const name = tokens.shift();
-  if (!name) throw new Error('用法：/new <name> [--agent codex] [--cwd path] [--cmd command]');
+  if (!name) throw new Error('用法：/new <name> [--backend codex-app-server|tmux] [--agent codex] [--cwd path] [--cmd command]');
   if (state.sessions[name]) throw new Error(`session 已存在：${name}`);
 
   const opts = parseOptions(tokens);
   const agent = opts.agent || 'codex';
+  const backend = opts.backend || (agent === 'codex' ? cfg.defaultBackend : 'tmux');
   const cwd = opts.cwd || cfg.defaultWorkdir;
   const command = opts.cmd || defaultCommandForAgent(agent, cwd);
   state.sessions[name] = {
-    backend: opts.backend || 'tmux',
+    backend,
     agent,
+    threadId: null,
     tmuxSession: opts.tmux || `far-${name}`,
     cwd,
     command,
@@ -447,21 +470,21 @@ async function cmdNew(event, tokens) {
     updatedAt: now(),
   };
   writeJson(SESSIONS_PATH, state.sessions);
-  backendFor(state.sessions[name]).ensure(name);
-  await reply(event.message_id || event.id, `已创建并启动 session: ${name}\nagent: ${agent}\ncwd: ${cwd}`);
+  await backendFor(state.sessions[name]).ensure(name);
+  await reply(event.message_id || event.id, `已创建并启动 session: ${name}\nbackend: ${backend}\nagent: ${agent}\ncwd: ${cwd}`);
 }
 
 async function cmdStop(event, tokens) {
   const sessionName = tokens[0] || resolveSessionName(event);
   const backend = backendFor(getSession(sessionName));
-  backend.stop(sessionName);
+  await backend.stop(sessionName);
   await reply(event.message_id || event.id, `已停止 session: ${sessionName}`);
 }
 
 async function cmdRestart(event, tokens) {
   const sessionName = tokens[0] || resolveSessionName(event);
   const backend = backendFor(getSession(sessionName));
-  backend.restart(sessionName);
+  await backend.restart(sessionName);
   await reply(event.message_id || event.id, `已重启 session: ${sessionName}`);
 }
 
@@ -492,16 +515,37 @@ async function sendToResolvedSession(event, content, opts = {}) {
 async function sendToSession(event, sessionName, content, opts = {}) {
   const session = getSession(sessionName);
   const backend = backendFor(session);
-  backend.ensure(sessionName);
   const inbox = opts.saveInbox ? createInboxEntry(event) : null;
   const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
-  const before = backend.capture(sessionName);
-  backend.send(sessionName, prompt);
-  const { output, elapsedMs, stable } = await backend.waitForOutput(sessionName, before);
+  const result = await runSessionWithFallback(sessionName, backend, prompt);
+  const { output, elapsedMs, stable, backendName, fallbackReason } = result;
   const text = output.trim()
-    ? `session: ${sessionName}\n用时 ${(elapsedMs / 1000).toFixed(1)}s\n\n${trimReply(output)}`
+    ? [
+      `session: ${sessionName}`,
+      `backend: ${backendName}`,
+      `用时 ${(elapsedMs / 1000).toFixed(1)}s`,
+      fallbackReason ? `fallback: ${fallbackReason}` : '',
+      '',
+      trimReply(output),
+    ].filter((line) => line !== '').join('\n')
     : `已投递到 ${sessionName}，但 ${Math.round(cfg.maxWaitMs / 1000)}s 内没有捕获到新输出。`;
   await reply(event.message_id || event.id, stable ? text : `${text}\n\n[提示] 输出可能还没完全结束，可发 /capture ${sessionName} 查看。`);
+}
+
+async function runSessionWithFallback(sessionName, backend, prompt) {
+  try {
+    return await backend.run(sessionName, prompt);
+  } catch (error) {
+    const session = getSession(sessionName);
+    if (session.backend !== 'codex-app-server' || session.fallback === false) throw error;
+    log('codex app-server failed; falling back to tmux', { sessionName, error: error.message || String(error) });
+    const result = await tmuxBackend.run(sessionName, prompt);
+    return {
+      ...result,
+      backendName: 'tmux',
+      fallbackReason: error.message || String(error),
+    };
+  }
 }
 
 function resolveSessionName(event) {
@@ -518,61 +562,442 @@ function getSession(name) {
   return session;
 }
 
+async function ensureCodexThread(name) {
+  await codexAppServer.ensureReady();
+  const session = getSession(name);
+  if (session.threadId && codexAppServer.hasThread(session.threadId)) return session.threadId;
+
+  if (session.threadId) {
+    try {
+      await codexAppServer.threadResume({
+        threadId: session.threadId,
+        cwd: session.cwd || cfg.defaultWorkdir,
+        approvalPolicy: cfg.codexApprovalPolicy,
+        sandbox: cfg.codexSandbox,
+        config: codexConfig(),
+        ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
+      });
+      return session.threadId;
+    } catch (error) {
+      log('codex thread resume failed; starting a new thread', {
+        sessionName: name,
+        threadId: session.threadId,
+        error: error.message || String(error),
+      });
+    }
+  }
+
+  const result = await codexAppServer.threadStart({
+    cwd: session.cwd || cfg.defaultWorkdir,
+    approvalPolicy: cfg.codexApprovalPolicy,
+    sandbox: cfg.codexSandbox,
+    config: codexConfig(),
+    ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
+  });
+  const threadId = result.thread.id;
+  updateSessionFields(name, { threadId, updatedAt: now() });
+  return threadId;
+}
+
+function codexConfig() {
+  return {
+    sandbox_workspace_write: {
+      network_access: Boolean(cfg.codexNetworkAccess),
+    },
+  };
+}
+
+class CodexAppServerClient {
+  constructor() {
+    this.requestId = 0;
+    this.pending = new Map();
+    this.turns = new Map();
+    this.liveThreads = new Set();
+    this.child = null;
+    this.ws = null;
+    this.ready = null;
+    this.port = null;
+  }
+
+  async ensureReady() {
+    if (this.ready) return this.ready;
+    this.ready = this.start();
+    return this.ready;
+  }
+
+  async start() {
+    if (typeof WebSocket !== 'function') {
+      throw new Error('当前 Node.js 没有全局 WebSocket，无法使用 codex-app-server backend。');
+    }
+    this.port = cfg.codexAppServerPort || await allocatePort();
+    const listenUrl = `ws://127.0.0.1:${this.port}`;
+    log('starting codex app-server', { listenUrl });
+    this.child = spawn(cfg.codexPath, ['app-server', '--listen', listenUrl], {
+      cwd: ROOT,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    this.child.stdout?.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) log(`[codex app-server] ${text}`);
+    });
+    this.child.stderr?.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) log(`[codex app-server] ${text}`);
+    });
+    this.child.once('exit', (code, signal) => {
+      log('codex app-server exited', { code, signal });
+      this.rejectAll(new Error(`Codex app-server exited: ${signal || code}`));
+      this.ws = null;
+      this.ready = null;
+      this.liveThreads.clear();
+    });
+
+    await waitForWebSocket(listenUrl, cfg.codexStartTimeoutMs);
+    this.ws = new WebSocket(listenUrl);
+    this.ws.addEventListener('message', (event) => this.handleMessage(event.data));
+    this.ws.addEventListener('close', () => {
+      this.rejectAll(new Error('Codex app-server websocket closed'));
+      this.ws = null;
+      this.ready = null;
+      this.liveThreads.clear();
+    });
+    this.ws.addEventListener('error', () => log('codex app-server websocket error'));
+    await waitForWebSocketOpen(this.ws, cfg.codexStartTimeoutMs);
+
+    await this.request('initialize', {
+      clientInfo: { name: 'feishu-agent-router', title: 'Feishu Agent Router', version: '0.1.0' },
+      capabilities: {
+        experimentalApi: true,
+        requestAttestation: false,
+        optOutNotificationMethods: null,
+      },
+    });
+    this.notify('initialized');
+  }
+
+  hasThread(threadId) {
+    return Boolean(threadId && this.liveThreads.has(threadId));
+  }
+
+  async threadStart(params) {
+    const result = await this.request('thread/start', params);
+    if (result.thread?.id) this.liveThreads.add(result.thread.id);
+    return result;
+  }
+
+  async threadResume(params) {
+    const result = await this.request('thread/resume', params);
+    this.liveThreads.add(params.threadId);
+    return result;
+  }
+
+  async turnStart(params) {
+    const result = await this.request('turn/start', params);
+    const turnId = result.turn.id;
+    return new Promise((resolve, reject) => {
+      this.turns.set(turnId, {
+        threadId: params.threadId,
+        text: '',
+        final: '',
+        lastError: null,
+        resolve,
+        reject,
+      });
+      setTimeout(() => {
+        const turn = this.turns.get(turnId);
+        if (!turn) return;
+        this.turns.delete(turnId);
+        reject(new Error('Timed out waiting for turn/completed'));
+      }, cfg.codexRequestTimeoutMs);
+    });
+  }
+
+  interruptThread(threadId) {
+    if (!threadId) return;
+    for (const [turnId, turn] of this.turns.entries()) {
+      if (turn.threadId === threadId) {
+        this.request('turn/interrupt', { threadId, turnId }).catch((error) => {
+          log('codex turn interrupt failed', { error: error.message || String(error) });
+        });
+      }
+    }
+  }
+
+  request(method, params) {
+    const id = ++this.requestId;
+    this.send({ id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        reject(new Error(`Timed out waiting for ${method}`));
+      }, cfg.codexRequestTimeoutMs);
+      this.pending.set(id, { resolve, reject, method, timer });
+    });
+  }
+
+  notify(method, params) {
+    this.send(params === undefined ? { method } : { method, params });
+  }
+
+  send(payload) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Codex app-server websocket is not open');
+    }
+    this.ws.send(JSON.stringify(payload));
+  }
+
+  handleMessage(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      log('ignoring non-json codex app-server message', { raw: String(raw).slice(0, 200) });
+      return;
+    }
+
+    if (msg.id && !msg.method) {
+      const pending = this.pending.get(msg.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pending.delete(msg.id);
+      if (msg.error) pending.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      else pending.resolve(msg.result);
+      return;
+    }
+
+    if (msg.id && msg.method) {
+      this.handleServerRequest(msg);
+      return;
+    }
+
+    if (msg.method) this.handleNotification(msg);
+  }
+
+  handleNotification(msg) {
+    if (msg.method === 'item/agentMessage/delta') {
+      const turn = this.turns.get(msg.params.turnId);
+      if (turn) turn.text += msg.params.delta || '';
+      return;
+    }
+    if (msg.method === 'item/completed') {
+      const turn = this.turns.get(msg.params.turnId);
+      if (turn && msg.params.item?.type === 'agentMessage') {
+        turn.final = msg.params.item.text || turn.text;
+      }
+      return;
+    }
+    if (msg.method === 'error') {
+      const turn = this.turns.get(msg.params.turnId);
+      if (turn) turn.lastError = msg.params.error;
+      if (!msg.params.willRetry) {
+        log('codex turn error', { error: msg.params.error?.message || 'unknown error' });
+      }
+      return;
+    }
+    if (msg.method === 'turn/completed') {
+      const turnId = msg.params.turn.id;
+      const turn = this.turns.get(turnId);
+      if (!turn) return;
+      this.turns.delete(turnId);
+      if (msg.params.turn.status === 'failed') {
+        turn.reject(new Error(msg.params.turn.error?.message || turn.lastError?.message || 'Codex turn failed'));
+      } else {
+        turn.resolve(turn.final || turn.text || '');
+      }
+      return;
+    }
+    if (msg.method === 'warning') {
+      log('codex warning', { message: msg.params.message || JSON.stringify(msg.params) });
+    }
+  }
+
+  handleServerRequest(msg) {
+    if (
+      msg.method === 'item/commandExecution/requestApproval' ||
+      msg.method === 'item/fileChange/requestApproval' ||
+      msg.method === 'item/permissions/requestApproval'
+    ) {
+      this.send({ id: msg.id, result: { decision: cfg.codexAutoApproveRequests ? 'accept' : 'decline' } });
+      return;
+    }
+    if (msg.method === 'item/tool/requestUserInput' || msg.method === 'mcpServer/elicitation/request') {
+      this.send({ id: msg.id, result: { answers: {} } });
+      return;
+    }
+    this.send({ id: msg.id, error: { code: -32000, message: `Unsupported app-server request ${msg.method}` } });
+  }
+
+  rejectAll(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    for (const [turnId, turn] of this.turns.entries()) {
+      turn.reject(error);
+      this.turns.delete(turnId);
+    }
+  }
+
+  statusText() {
+    return this.ws?.readyState === WebSocket.OPEN ? `running ws://127.0.0.1:${this.port}` : 'stopped';
+  }
+
+  close() {
+    try { this.ws?.close(); } catch {}
+    try { this.child?.kill(); } catch {}
+  }
+}
+
 function backendFor(session) {
+  if (session.backend === 'codex-app-server') return codexAppServerBackend;
   if (session.backend === 'tmux') return tmuxBackend;
   throw new Error(`不支持的 backend：${session.backend}`);
 }
 
-const tmuxBackend = {
-  ensure(name) {
+const codexAppServer = new CodexAppServerClient();
+
+const codexAppServerBackend = {
+  async ensure(name) {
+    await codexAppServer.ensureReady();
+    updateSessionState(name, 'running');
+  },
+  async run(name, text) {
+    const start = Date.now();
+    const threadId = await ensureCodexThread(name);
+    const output = await codexAppServer.turnStart({
+      threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+      cwd: getSession(name).cwd || cfg.defaultWorkdir,
+      approvalPolicy: cfg.codexApprovalPolicy,
+      ...(cfg.codexModel ? { model: cfg.codexModel } : {}),
+      ...(cfg.codexReasoningEffort ? { effort: cfg.codexReasoningEffort } : {}),
+    });
+    updateSessionFields(name, {
+      state: 'running',
+      lastOutput: output,
+      lastBackend: 'codex-app-server',
+      updatedAt: now(),
+    });
+    return {
+      output,
+      elapsedMs: Date.now() - start,
+      stable: true,
+      backendName: 'codex-app-server',
+    };
+  },
+  async capture(name) {
     const session = getSession(name);
-    if (hasTmuxSession(session.tmuxSession)) {
+    return [
+      `session: ${name}`,
+      `backend: codex-app-server`,
+      `app-server: ${codexAppServer.statusText()}`,
+      `thread: ${session.threadId || '(new)'}`,
+      `cwd: ${session.cwd || cfg.defaultWorkdir}`,
+      '',
+      session.lastOutput || '(no last output)',
+    ].join('\n');
+  },
+  async status(name) {
+    const session = getSession(name);
+    return [
+      `session: ${name}`,
+      `backend: codex-app-server`,
+      `app-server: ${codexAppServer.statusText()}`,
+      `thread: ${session.threadId || '(new)'}`,
+      `cwd: ${session.cwd || cfg.defaultWorkdir}`,
+      `model: ${cfg.codexModel || '(Codex default)'}`,
+      `effort: ${cfg.codexReasoningEffort || '(default)'}`,
+      `sandbox: ${cfg.codexSandbox}`,
+      `approval: ${cfg.codexApprovalPolicy}`,
+      `fallback tmux: ${session.tmuxSession || cfg.defaultTmuxSession}`,
+      `updated: ${session.updatedAt || '-'}`,
+    ].join('\n');
+  },
+  async interrupt(name) {
+    codexAppServer.interruptThread(getSession(name).threadId);
+  },
+  async stop(name) {
+    updateSessionFields(name, { state: 'stopped', updatedAt: now() });
+  },
+  async restart(name) {
+    updateSessionFields(name, { threadId: null, state: 'stopped', updatedAt: now() });
+    await this.ensure(name);
+  },
+};
+
+const tmuxBackend = {
+  async ensure(name) {
+    const session = getSession(name);
+    const tmuxSession = session.tmuxSession || cfg.defaultTmuxSession;
+    const cwd = session.cwd || cfg.defaultWorkdir;
+    const command = session.command || cfg.defaultCommand;
+    if (hasTmuxSession(tmuxSession)) {
       updateSessionState(name, 'running');
       return;
     }
-    log(`creating tmux session`, { name, tmuxSession: session.tmuxSession, cwd: session.cwd });
-    run('tmux', ['new-session', '-d', '-s', session.tmuxSession, '-c', session.cwd, 'sh', '-lc', session.command]);
+    log(`creating tmux session`, { name, tmuxSession, cwd });
+    run('tmux', ['new-session', '-d', '-s', tmuxSession, '-c', cwd, 'sh', '-lc', command]);
     updateSessionState(name, 'running');
   },
-  send(name, text) {
+  async run(name, text) {
+    await this.ensure(name);
+    const before = await this.capture(name);
+    await this.send(name, text);
+    const result = await this.waitForOutput(name, before);
+    updateSessionFields(name, {
+      state: 'running',
+      lastOutput: result.output,
+      lastBackend: 'tmux',
+      updatedAt: now(),
+    });
+    return { ...result, backendName: 'tmux' };
+  },
+  async send(name, text) {
     const session = getSession(name);
+    const tmuxSession = session.tmuxSession || cfg.defaultTmuxSession;
     run('tmux', ['load-buffer', '-b', 'feishu-agent-router', '-'], { input: text });
-    run('tmux', ['paste-buffer', '-b', 'feishu-agent-router', '-t', session.tmuxSession]);
+    run('tmux', ['paste-buffer', '-b', 'feishu-agent-router', '-t', tmuxSession]);
     sleepSync(250);
-    run('tmux', ['send-keys', '-t', session.tmuxSession, 'Enter']);
+    run('tmux', ['send-keys', '-t', tmuxSession, 'Enter']);
   },
-  capture(name) {
+  async capture(name) {
     const session = getSession(name);
-    if (!hasTmuxSession(session.tmuxSession)) return `[session stopped] ${name}`;
-    return run('tmux', ['capture-pane', '-t', session.tmuxSession, '-p', '-S', `-${cfg.captureLines}`]);
+    const tmuxSession = session.tmuxSession || cfg.defaultTmuxSession;
+    if (!hasTmuxSession(tmuxSession)) return `[session stopped] ${name}`;
+    return run('tmux', ['capture-pane', '-t', tmuxSession, '-p', '-S', `-${cfg.captureLines}`]);
   },
-  status(name) {
+  async status(name) {
     const session = getSession(name);
-    const running = hasTmuxSession(session.tmuxSession);
+    const tmuxSession = session.tmuxSession || cfg.defaultTmuxSession;
+    const running = hasTmuxSession(tmuxSession);
     return [
       `session: ${name}`,
       `backend: ${session.backend}`,
       `agent: ${session.agent}`,
-      `tmux: ${session.tmuxSession} ${running ? 'running' : 'stopped'}`,
-      `cwd: ${session.cwd}`,
-      `command: ${session.command}`,
+      `tmux: ${tmuxSession} ${running ? 'running' : 'stopped'}`,
+      `cwd: ${session.cwd || cfg.defaultWorkdir}`,
+      `command: ${session.command || cfg.defaultCommand}`,
       `updated: ${session.updatedAt || '-'}`,
     ].join('\n');
   },
-  interrupt(name) {
+  async interrupt(name) {
     const session = getSession(name);
-    if (hasTmuxSession(session.tmuxSession)) {
-      run('tmux', ['send-keys', '-t', session.tmuxSession, 'C-c']);
+    const tmuxSession = session.tmuxSession || cfg.defaultTmuxSession;
+    if (hasTmuxSession(tmuxSession)) {
+      run('tmux', ['send-keys', '-t', tmuxSession, 'C-c']);
     }
   },
-  stop(name) {
+  async stop(name) {
     const session = getSession(name);
-    spawnSync('tmux', ['kill-session', '-t', session.tmuxSession], { encoding: 'utf8' });
+    spawnSync('tmux', ['kill-session', '-t', session.tmuxSession || cfg.defaultTmuxSession], { encoding: 'utf8' });
     updateSessionState(name, 'stopped');
   },
-  restart(name) {
-    this.stop(name);
-    this.ensure(name);
+  async restart(name) {
+    await this.stop(name);
+    await this.ensure(name);
   },
   async waitForOutput(name, before) {
     const start = Date.now();
@@ -609,6 +1034,14 @@ function updateSessionState(name, value) {
   writeJson(SESSIONS_PATH, state.sessions);
 }
 
+function updateSessionFields(name, fields) {
+  state.sessions[name] = {
+    ...state.sessions[name],
+    ...fields,
+  };
+  writeJson(SESSIONS_PATH, state.sessions);
+}
+
 function stopIdleSessions() {
   reloadState();
   const cutoff = Date.now() - cfg.idleStopMs;
@@ -618,7 +1051,9 @@ function stopIdleSessions() {
     const updated = Date.parse(session.updatedAt || session.createdAt || 0);
     if (!Number.isFinite(updated) || updated >= cutoff) continue;
     try {
-      backendFor(session).stop(name);
+      Promise.resolve(backendFor(session).stop(name)).catch((error) => {
+        log(`idle stop failed`, { name, error: stackOf(error) });
+      });
       log(`idle-stopped session`, { name });
     } catch (error) {
       log(`idle stop failed`, { name, error: stackOf(error) });
@@ -705,8 +1140,13 @@ function audit(direction, event, extra = {}) {
 
 function sessionsText() {
   return Object.entries(state.sessions).map(([name, session]) => {
-    const running = session.backend === 'tmux' && hasTmuxSession(session.tmuxSession);
-    return `${name}: ${session.agent}/${session.backend} ${running ? 'running' : 'stopped'} cwd=${session.cwd}`;
+    const running = session.backend === 'tmux'
+      ? hasTmuxSession(session.tmuxSession || cfg.defaultTmuxSession)
+      : session.state === 'running';
+    const detail = session.backend === 'codex-app-server'
+      ? `thread=${session.threadId || '(new)'}`
+      : `tmux=${session.tmuxSession || cfg.defaultTmuxSession}`;
+    return `${name}: ${session.agent}/${session.backend} ${running ? 'running' : 'stopped'} cwd=${session.cwd || cfg.defaultWorkdir} ${detail}`;
   }).join('\n') || '(no sessions)';
 }
 
@@ -736,7 +1176,7 @@ function helpText() {
     '/capture [session]',
     '/status [session]',
     '/interrupt [session]',
-    '/new <name> [--agent codex|claude|gemini|script] [--cwd path] [--cmd command]',
+    '/new <name> [--backend codex-app-server|tmux] [--agent codex|claude|gemini|script] [--cwd path] [--cmd command]',
     '/stop [session]',
     '/restart [session]',
     '/file [session] [note]',
@@ -870,6 +1310,49 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function allocatePort() {
+  const server = net.createServer();
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const port = server.address().port;
+  server.close();
+  return port;
+}
+
+async function waitForWebSocket(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const ws = new WebSocket(url);
+      await waitForWebSocketOpen(ws, 500);
+      ws.close();
+      return;
+    } catch (error) {
+      lastError = error;
+      await sleep(150);
+    }
+  }
+  throw new Error(`Codex app-server did not become ready: ${lastError?.message || lastError || 'timeout'}`);
+}
+
+function waitForWebSocketOpen(ws, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error('websocket open timeout'));
+    }, timeoutMs);
+    ws.addEventListener('open', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+    ws.addEventListener('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    }, { once: true });
+  });
+}
+
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -886,5 +1369,6 @@ function stackOf(error) {
 function shutdown() {
   shuttingDown = true;
   log('shutting down');
+  codexAppServer.close();
   process.exit(0);
 }
