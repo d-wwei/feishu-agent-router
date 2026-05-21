@@ -150,6 +150,7 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_CODEX_HTTP_PROVIDER_ID: optionOrEnv('codexHttpProviderId', 'FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
     FTB_CODEX_HTTP_PROVIDER_NAME: optionOrEnv('codexHttpProviderName', 'FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
     FTB_CODEX_HTTP_PROVIDER_BASE_URL: optionOrEnv('codexHttpProviderBaseUrl', 'FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
+    FTB_ENABLE_TMUX_FALLBACK: optionOrEnv('enableTmuxFallback', 'FTB_ENABLE_TMUX_FALLBACK', 'false'),
     FTB_PREWARM_CODEX: optionOrEnv('prewarmCodex', 'FTB_PREWARM_CODEX', 'true'),
     FTB_PREWARM_SESSIONS: optionOrEnv('prewarmSessions', 'FTB_PREWARM_SESSIONS', 'main'),
     FTB_PREWARM_TURN: optionOrEnv('prewarmTurn', 'FTB_PREWARM_TURN', 'false'),

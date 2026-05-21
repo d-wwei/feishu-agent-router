@@ -43,6 +43,16 @@ import {
   bridgeDeveloperInstructions,
   buildPrompt,
 } from '../lib/bridge-prompt.mjs';
+import {
+  shouldUseTmuxFallback,
+  isCodexFirstOutputTimeout,
+  userFacingSessionError,
+} from '../lib/bridge-fallback.mjs';
+import {
+  assistantOutput,
+  diffText,
+  hasAssistantOutput,
+} from '../lib/tmux-output.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -113,6 +123,7 @@ const cfg = {
   codexHttpProviderId: env('FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
   codexHttpProviderName: env('FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
   codexHttpProviderBaseUrl: env('FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
+  enableTmuxFallback: boolEnv('FTB_ENABLE_TMUX_FALLBACK', false),
   prewarmCodex: boolEnv('FTB_PREWARM_CODEX', true),
   prewarmSessions: csvEnv('FTB_PREWARM_SESSIONS', env('FTB_DEFAULT_SESSION', 'main')),
   prewarmTurn: boolEnv('FTB_PREWARM_TURN', false),
@@ -875,27 +886,6 @@ function logTurnTiming(sessionName, backendName, timing, extra = {}) {
   });
 }
 
-function isCodexFirstOutputTimeout(error) {
-  return error?.code === 'CODEX_FIRST_OUTPUT_TIMEOUT' ||
-    /Timed out waiting for first Codex output event/i.test(error?.message || '');
-}
-
-function userFacingSessionError(error, sessionName) {
-  if (isCodexFirstOutputTimeout(error)) {
-    return [
-      'Codex 这轮没有及时开始输出，我已经中断并重置了会话。',
-      `你可以直接重发刚才那句，session=${sessionName}。`,
-    ].join('\n');
-  }
-  return [
-    `投递到 ${sessionName} 失败。`,
-    '',
-    error?.message || String(error),
-    '',
-    '桥接服务仍在运行；请稍后重试，或发 /status 查看 session 状态。',
-  ].join('\n');
-}
-
 function shouldShowColdStartCard(sessionName, session) {
   if (cfg.feishuStreamingMode === 'off') return false;
   if (session.backend !== 'codex-app-server') return false;
@@ -924,7 +914,7 @@ async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
     return await backend.run(sessionName, prompt, opts);
   } catch (error) {
     const session = getSession(sessionName);
-    if (session.backend !== 'codex-app-server' || session.fallback === false) throw error;
+    if (!shouldUseTmuxFallback(session, cfg)) throw error;
     log('codex app-server failed; falling back to tmux', { sessionName, error: error.message || String(error) });
     updateSessionFields(sessionName, { threadId: null, state: 'stopped', updatedAt: now() });
     const result = await tmuxBackend.run(sessionName, prompt, opts);
@@ -2163,48 +2153,6 @@ function shellWords(input) {
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function hasAssistantOutput(before, after) {
-  return Boolean(assistantOutput(before, after));
-}
-
-function assistantOutput(before, after) {
-  const lines = String(after || '').split('\n');
-  const promptStart = findLastIndex(lines, (line) => line.trim().startsWith('› 飞书远程消息'));
-  const searchFrom = promptStart >= 0 ? promptStart + 1 : 0;
-  const start = lines.findIndex((line, index) => index >= searchFrom && line.trim().startsWith('• '));
-  if (start < 0) return '';
-  const kept = [];
-  for (const line of lines.slice(start)) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('› ')) break;
-    if (trimmed.includes('esc to interrupt')) continue;
-    if (trimmed.includes('tab to queue message')) continue;
-    kept.push(kept.length === 0 ? line.replace(/^(\s*)•\s?/, '$1') : line);
-  }
-  return kept.join('\n').trim();
-}
-
-function findLastIndex(items, predicate) {
-  for (let index = items.length - 1; index >= 0; index--) {
-    if (predicate(items[index], index)) return index;
-  }
-  return -1;
-}
-
-function diffText(before, after) {
-  if (after.startsWith(before)) return after.slice(before.length);
-  const beforeLines = before.split('\n');
-  const afterLines = after.split('\n');
-  let overlap = Math.min(beforeLines.length, afterLines.length);
-  while (overlap > 0) {
-    const a = beforeLines.slice(beforeLines.length - overlap).join('\n');
-    const b = afterLines.slice(0, overlap).join('\n');
-    if (a === b) break;
-    overlap--;
-  }
-  return afterLines.slice(overlap).join('\n');
 }
 
 function trimReply(text) {

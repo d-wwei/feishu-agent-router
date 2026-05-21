@@ -7,7 +7,7 @@ Feishu official events/messages/files
 -> local router daemon
 -> session registry and route table
 -> backend adapter
--> Codex app-server, or tmux fallback for terminal agents
+-> Codex app-server, or explicitly configured tmux terminal agents
 ```
 
 The router daemon is intentionally not an agent. It listens, checks permissions, parses commands, stores incoming materials, routes messages to sessions, captures output, and replies in Feishu.
@@ -247,7 +247,7 @@ Phase 1: router MVP
 - `/bind`, `/use`
 - `/send`, `/capture`, `/interrupt`
 - Codex app-server backend with persistent Codex threads
-- tmux backend kept as a fallback and for terminal agents
+- tmux backend kept for explicit terminal-agent sessions
 
 Phase 2: office materials
 
@@ -262,7 +262,7 @@ Phase 3: multi-agent routing
 
 - Sessions are backend/agent/command records
 - Codex sessions can use `codex-app-server` and keep a `threadId`
-- The tmux backend can start any command and is used as fallback when app-server fails
+- The tmux backend can start any command for explicit terminal-agent sessions
 - Feishu chats/users/threads can map to different sessions
 - Optional idle auto-stop is available via `FTB_IDLE_STOP_MS` and per-session `"idleStop": true`
 
@@ -302,6 +302,7 @@ FTB_CODEX_RESPONSES_WEBSOCKETS=false
 FTB_CODEX_FORCE_RESPONSES_HTTP=true
 FTB_CODEX_HTTP_PROVIDER_ID=chatgpt_http
 FTB_CODEX_HTTP_PROVIDER_BASE_URL=https://chatgpt.com/backend-api/codex
+FTB_ENABLE_TMUX_FALLBACK=false
 FTB_PREWARM_CODEX=true
 FTB_PREWARM_SESSIONS=main
 FTB_PREWARM_TURN=false
@@ -309,7 +310,7 @@ FTB_CODEX_REQUEST_TIMEOUT_MS=120000
 FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS=90000
 ```
 
-The tmux fallback command also defaults to:
+The tmux command also defaults to:
 
 ```text
 codex --no-alt-screen --cd <cwd> --sandbox danger-full-access -a never
@@ -330,6 +331,9 @@ process/thread cold-start cost. Each app-server turn logs `appServerReadyMs`,
 `totalMs` to `logs/router.log`.
 They can be tightened in `.env` per deployment.
 
-`tmux` remains available as a fallback. If a `codex-app-server` session fails
-and the session does not set `"fallback": false`, the router sends the same
-prompt to the session's `tmuxSession` and replies with the tmux result.
+`tmux` remains available for explicit terminal-agent sessions. Automatic
+fallback from `codex-app-server` to tmux is disabled by default because a broken
+terminal Codex environment can leak TUI chrome back to Feishu and create extra
+local Codex sessions. Set `FTB_ENABLE_TMUX_FALLBACK=true` only for deployments
+where the tmux command is known to inherit the required model/provider
+environment and terminal output parsing is acceptable.
