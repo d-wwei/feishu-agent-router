@@ -299,7 +299,7 @@ FTB_CODEX_SANDBOX=danger-full-access
 FTB_CODEX_APPROVAL_POLICY=never
 FTB_CODEX_AUTO_APPROVE_REQUESTS=true
 FTB_CODEX_RESPONSES_WEBSOCKETS=false
-FTB_CODEX_FORCE_RESPONSES_HTTP=true
+FTB_CODEX_FORCE_RESPONSES_HTTP=false
 FTB_CODEX_HTTP_PROVIDER_ID=chatgpt_http
 FTB_CODEX_HTTP_PROVIDER_BASE_URL=https://chatgpt.com/backend-api/codex
 FTB_ENABLE_TMUX_FALLBACK=false
@@ -321,9 +321,10 @@ codex --no-alt-screen --cd <cwd> --sandbox danger-full-access -a never
 These defaults avoid permission prompts and sandbox blocks while controlling
 the machine from Feishu. Response websockets are disabled on the bridge path so
 Codex uses HTTP streaming instead of waiting on a stalled websocket first event.
-For newer Codex builds where the removed `responses_websockets` feature flag no
-longer controls the built-in ChatGPT provider, `FTB_CODEX_FORCE_RESPONSES_HTTP`
-adds a local provider override with `wire_api="responses"` and
+By default, the app-server does not override `model_provider`, so Codex inherits
+the user's global Codex profile/provider. For deployments that intentionally
+need the ChatGPT HTTP provider override, set `FTB_CODEX_FORCE_RESPONSES_HTTP=true`;
+that adds a local provider override with `wire_api="responses"` and
 `supports_websockets=false`. The first-output timeout interrupts a turn that
 never starts producing app-server activity. After the first activity, turns use
 an idle timeout instead of a short absolute completion cutoff: any agent delta,

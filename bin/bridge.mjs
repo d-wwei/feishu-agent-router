@@ -125,7 +125,7 @@ const cfg = {
   codexNetworkAccess: boolEnv('FTB_CODEX_NETWORK_ACCESS', true),
   codexAutoApproveRequests: boolEnv('FTB_CODEX_AUTO_APPROVE_REQUESTS', true),
   codexResponsesWebSockets: boolEnv('FTB_CODEX_RESPONSES_WEBSOCKETS', false),
-  codexForceResponsesHttp: boolEnv('FTB_CODEX_FORCE_RESPONSES_HTTP', true),
+  codexForceResponsesHttp: boolEnv('FTB_CODEX_FORCE_RESPONSES_HTTP', false),
   codexHttpProviderId: env('FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
   codexHttpProviderName: env('FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
   codexHttpProviderBaseUrl: env('FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),

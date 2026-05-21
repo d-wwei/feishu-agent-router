@@ -38,6 +38,7 @@ test('bridge-instance generated env pins lark profile and app id', () => {
   assert.match(result.stdout, /^FTB_LARK_PROFILE=sales-bot$/m);
   assert.match(result.stdout, /^FTB_LARK_APP_ID=cli_sales$/m);
   assert.match(result.stdout, /^FTB_ENABLE_TMUX_FALLBACK=false$/m);
+  assert.match(result.stdout, /^FTB_CODEX_FORCE_RESPONSES_HTTP=false$/m);
 });
 
 test('bridge-instance quotes workdir in fallback agent command', () => {

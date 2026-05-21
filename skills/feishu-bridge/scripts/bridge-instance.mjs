@@ -146,7 +146,7 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_CODEX_NETWORK_ACCESS: optionOrEnv('codexNetworkAccess', 'FTB_CODEX_NETWORK_ACCESS', 'true'),
     FTB_CODEX_AUTO_APPROVE_REQUESTS: optionOrEnv('codexAutoApproveRequests', 'FTB_CODEX_AUTO_APPROVE_REQUESTS', 'true'),
     FTB_CODEX_RESPONSES_WEBSOCKETS: optionOrEnv('codexResponsesWebSockets', 'FTB_CODEX_RESPONSES_WEBSOCKETS', 'false'),
-    FTB_CODEX_FORCE_RESPONSES_HTTP: optionOrEnv('codexForceResponsesHttp', 'FTB_CODEX_FORCE_RESPONSES_HTTP', 'true'),
+    FTB_CODEX_FORCE_RESPONSES_HTTP: optionOrEnv('codexForceResponsesHttp', 'FTB_CODEX_FORCE_RESPONSES_HTTP', 'false'),
     FTB_CODEX_HTTP_PROVIDER_ID: optionOrEnv('codexHttpProviderId', 'FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
     FTB_CODEX_HTTP_PROVIDER_NAME: optionOrEnv('codexHttpProviderName', 'FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
     FTB_CODEX_HTTP_PROVIDER_BASE_URL: optionOrEnv('codexHttpProviderBaseUrl', 'FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
