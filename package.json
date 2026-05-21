@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node bin/bridge.mjs",
     "doctor": "node bin/doctor.mjs",
-    "check": "node --check bin/bridge.mjs && node --check bin/doctor.mjs && node --check bin/farctl.mjs && node --check skills/feishu-bridge/scripts/bridge-instance.mjs && node --check lib/codex-config.mjs && node --check lib/session-routing.mjs && node --check lib/lark-cli.mjs && node --check lib/allowlist-policy.mjs && node --check lib/feishu-render.mjs && node --check lib/feishu-ingest.mjs && node --check lib/feishu-interactions.mjs && node --check lib/bridge-output.mjs && node --check lib/bridge-prompt.mjs && node --check lib/bridge-fallback.mjs && node --check lib/tmux-output.mjs",
+    "check": "node --check bin/bridge.mjs && node --check bin/doctor.mjs && node --check bin/farctl.mjs && node --check skills/feishu-bridge/scripts/bridge-instance.mjs && node --check lib/codex-config.mjs && node --check lib/session-routing.mjs && node --check lib/lark-cli.mjs && node --check lib/allowlist-policy.mjs && node --check lib/feishu-render.mjs && node --check lib/feishu-ingest.mjs && node --check lib/feishu-interactions.mjs && node --check lib/bridge-output.mjs && node --check lib/bridge-prompt.mjs && node --check lib/bridge-fallback.mjs && node --check lib/codex-turn-timeout.mjs && node --check lib/tmux-output.mjs",
     "test": "node --test",
     "service": "node bin/farctl.mjs"
   },

@@ -157,6 +157,8 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_CODEX_REQUEST_TIMEOUT_MS: optionOrEnv('codexRequestTimeoutMs', 'FTB_CODEX_REQUEST_TIMEOUT_MS', '120000'),
     FTB_CODEX_START_TIMEOUT_MS: optionOrEnv('codexStartTimeoutMs', 'FTB_CODEX_START_TIMEOUT_MS', '8000'),
     FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS: optionOrEnv('codexFirstOutputTimeoutMs', 'FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', '90000'),
+    FTB_CODEX_TURN_IDLE_TIMEOUT_MS: optionOrEnv('codexTurnIdleTimeoutMs', 'FTB_CODEX_TURN_IDLE_TIMEOUT_MS', '300000'),
+    FTB_CODEX_TURN_HARD_TIMEOUT_MS: optionOrEnv('codexTurnHardTimeoutMs', 'FTB_CODEX_TURN_HARD_TIMEOUT_MS', '900000'),
     FTB_FEISHU_RICH_REPLIES: optionOrEnv('feishuRichReplies', 'FTB_FEISHU_RICH_REPLIES', 'true'),
     FTB_FEISHU_REACTIONS: optionOrEnv('feishuReactions', 'FTB_FEISHU_REACTIONS', 'true'),
     FTB_FEISHU_STREAMING: optionOrEnv('feishuStreaming', 'FTB_FEISHU_STREAMING', 'auto'),

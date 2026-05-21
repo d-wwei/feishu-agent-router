@@ -308,6 +308,8 @@ FTB_PREWARM_SESSIONS=main
 FTB_PREWARM_TURN=false
 FTB_CODEX_REQUEST_TIMEOUT_MS=120000
 FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS=90000
+FTB_CODEX_TURN_IDLE_TIMEOUT_MS=300000
+FTB_CODEX_TURN_HARD_TIMEOUT_MS=900000
 ```
 
 The tmux command also defaults to:
@@ -322,13 +324,18 @@ Codex uses HTTP streaming instead of waiting on a stalled websocket first event.
 For newer Codex builds where the removed `responses_websockets` feature flag no
 longer controls the built-in ChatGPT provider, `FTB_CODEX_FORCE_RESPONSES_HTTP`
 adds a local provider override with `wire_api="responses"` and
-`supports_websockets=false`. The first-output timeout interrupts any remaining
-stuck Codex turn before Feishu waits for Codex's internal 300s stall guard.
+`supports_websockets=false`. The first-output timeout interrupts a turn that
+never starts producing app-server activity. After the first activity, turns use
+an idle timeout instead of a short absolute completion cutoff: any agent delta,
+tool item, approval request, warning, or error refreshes
+`FTB_CODEX_TURN_IDLE_TIMEOUT_MS`. `FTB_CODEX_TURN_HARD_TIMEOUT_MS` remains as a
+long safety cap for a single Feishu-triggered turn even if activity continues.
 `FTB_PREWARM_CODEX=true` starts the app-server and resumes/creates listed Codex
 threads when the bridge starts, so the first Feishu message no longer pays the
 process/thread cold-start cost. Each app-server turn logs `appServerReadyMs`,
 `threadReadyMs`, `firstOutputMs`, `turnCompletedMs`, `feishuReplyMs`, and
-`totalMs` to `logs/router.log`.
+`totalMs` to `logs/router.log`. Timeout logs include the timeout kind, last
+activity type/detail, elapsed time, idle time, and a short agent-text preview.
 They can be tightened in `.env` per deployment.
 
 `tmux` remains available for explicit terminal-agent sessions. Automatic

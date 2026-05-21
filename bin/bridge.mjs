@@ -53,6 +53,10 @@ import {
   diffText,
   hasAssistantOutput,
 } from '../lib/tmux-output.mjs';
+import {
+  CodexTurnTimeoutController,
+  summarizeTurnDiagnostics,
+} from '../lib/codex-turn-timeout.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -108,6 +112,8 @@ const cfg = {
   codexRequestTimeoutMs: intEnv('FTB_CODEX_REQUEST_TIMEOUT_MS', 120_000),
   codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
   codexFirstOutputTimeoutMs: intEnv('FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', 90_000),
+  codexTurnIdleTimeoutMs: intEnv('FTB_CODEX_TURN_IDLE_TIMEOUT_MS', 300_000),
+  codexTurnHardTimeoutMs: intEnv('FTB_CODEX_TURN_HARD_TIMEOUT_MS', 900_000),
   codexExecTimeoutMs: intEnv('FTB_CODEX_EXEC_TIMEOUT_MS', 120_000),
   codexProfile: env('FTB_CODEX_PROFILE', ''),
   codexModel: env('FTB_CODEX_MODEL', ''),
@@ -1153,42 +1159,47 @@ class CodexAppServerClient {
     const result = await this.request('turn/start', params);
     const turnId = result.turn.id;
     return new Promise((resolve, reject) => {
-      const firstOutputTimer = setTimeout(() => {
-        const turn = this.turns.get(turnId);
-        if (!turn) return;
-        this.turns.delete(turnId);
-        this.request('turn/interrupt', { threadId: params.threadId, turnId }).catch((error) => {
-          log('codex turn interrupt failed after first-output timeout', { error: error.message || String(error) });
-        });
-        this.clearTurnTimers(turn);
-        const error = new Error(`Timed out waiting for first Codex output event after ${Math.round(cfg.codexFirstOutputTimeoutMs / 1000)}s`);
-        error.code = 'CODEX_FIRST_OUTPUT_TIMEOUT';
-        reject(error);
-      }, cfg.codexFirstOutputTimeoutMs);
-      const completionTimer = setTimeout(() => {
-        const turn = this.turns.get(turnId);
-        if (!turn) return;
-        this.turns.delete(turnId);
-        this.request('turn/interrupt', { threadId: params.threadId, turnId }).catch((error) => {
-          log('codex turn interrupt after timeout failed', { turnId, error: error.message || String(error) });
-        });
-        this.clearTurnTimers(turn);
-        reject(new Error('Timed out waiting for turn/completed; interrupt requested'));
-      }, cfg.codexRequestTimeoutMs);
-      this.turns.set(turnId, {
+      const turn = {
         threadId: params.threadId,
+        turnId,
         text: '',
         final: '',
         lastError: null,
         onDelta: opts.onDelta,
         startedAt: turnStartedAt,
         timing: opts.timing,
-        firstOutputTimer,
-        completionTimer,
         resolve,
         reject,
+      };
+      turn.timeoutController = new CodexTurnTimeoutController({
+        turn,
+        firstActivityTimeoutMs: cfg.codexFirstOutputTimeoutMs,
+        idleTimeoutMs: cfg.codexTurnIdleTimeoutMs,
+        hardTimeoutMs: cfg.codexTurnHardTimeoutMs,
+        onTimeout: (kind, error) => this.timeoutTurn(turnId, kind, error),
+      });
+      this.turns.set(turnId, turn);
+      turn.timeoutController.start();
+    });
+  }
+
+  timeoutTurn(turnId, kind, error) {
+    const turn = this.turns.get(turnId);
+    if (!turn) return;
+    this.turns.delete(turnId);
+    this.clearTurnTimers(turn);
+    log('codex turn timeout; interrupting', {
+      kind,
+      timeoutMs: error.timeoutMs,
+      diagnostics: error.diagnostics || summarizeTurnDiagnostics(turn),
+    });
+    this.request('turn/interrupt', { threadId: turn.threadId, turnId }).catch((interruptError) => {
+      log('codex turn interrupt after timeout failed', {
+        turnId,
+        error: interruptError.message || String(interruptError),
       });
     });
+    turn.reject(error);
   }
 
   interruptThread(threadId) {
@@ -1262,7 +1273,7 @@ class CodexAppServerClient {
     if (msg.method === 'item/agentMessage/delta') {
       const turn = this.turns.get(msg.params.turnId);
       if (turn) {
-        this.markTurnOutputStarted(turn);
+        this.recordTurnActivity(turn, msg.method, msg.params.delta);
         turn.text += msg.params.delta || '';
         if (typeof turn.onDelta === 'function') {
           try {
@@ -1276,15 +1287,20 @@ class CodexAppServerClient {
     }
     if (msg.method === 'item/completed') {
       const turn = this.turns.get(msg.params.turnId);
-      if (turn && msg.params.item?.type === 'agentMessage') {
-        this.markTurnOutputStarted(turn);
-        turn.final = msg.params.item.text || turn.text;
+      if (turn) {
+        this.recordTurnActivity(turn, msg.method, describeCodexItem(msg.params.item));
+        if (msg.params.item?.type === 'agentMessage') {
+          turn.final = msg.params.item.text || turn.text;
+        }
       }
       return;
     }
     if (msg.method === 'error') {
       const turn = this.turns.get(msg.params.turnId);
-      if (turn) turn.lastError = msg.params.error;
+      if (turn) {
+        turn.lastError = msg.params.error;
+        this.recordTurnActivity(turn, msg.method, msg.params.error?.message || 'unknown error');
+      }
       if (!msg.params.willRetry) {
         log('codex turn error', { error: msg.params.error?.message || 'unknown error' });
       }
@@ -1305,11 +1321,18 @@ class CodexAppServerClient {
       return;
     }
     if (msg.method === 'warning') {
-      log('codex warning', { message: msg.params.message || JSON.stringify(msg.params) });
+      const turn = this.turns.get(msg.params?.turnId);
+      if (turn) this.recordTurnActivity(turn, msg.method, msg.params?.message || JSON.stringify(msg.params));
+      log('codex warning', { message: msg.params?.message || JSON.stringify(msg.params) });
+      return;
     }
+    const turn = this.turns.get(msg.params?.turnId);
+    if (turn) this.recordTurnActivity(turn, msg.method, JSON.stringify(msg.params || {}).slice(0, 500));
   }
 
   handleServerRequest(msg) {
+    const turn = this.turns.get(msg.params?.turnId);
+    if (turn) this.recordTurnActivity(turn, msg.method, describeServerRequest(msg));
     if (
       msg.method === 'item/commandExecution/requestApproval' ||
       msg.method === 'item/fileChange/requestApproval'
@@ -1370,20 +1393,12 @@ class CodexAppServerClient {
     this.liveThreads.clear();
   }
 
-  markTurnOutputStarted(turn) {
-    if (turn.timing && turn.timing.firstOutputMs === undefined) {
-      turn.timing.firstOutputMs = Date.now() - turn.startedAt;
-    }
-    if (!turn.firstOutputTimer) return;
-    clearTimeout(turn.firstOutputTimer);
-    turn.firstOutputTimer = null;
+  recordTurnActivity(turn, type, detail = null) {
+    turn.timeoutController?.recordActivity(type, detail);
   }
 
   clearTurnTimers(turn) {
-    if (turn.firstOutputTimer) clearTimeout(turn.firstOutputTimer);
-    if (turn.completionTimer) clearTimeout(turn.completionTimer);
-    turn.firstOutputTimer = null;
-    turn.completionTimer = null;
+    turn.timeoutController?.clear();
   }
 
   statusText() {
@@ -1616,6 +1631,27 @@ function permissionApprovalResponse() {
     },
     scope: 'session',
   };
+}
+
+function describeCodexItem(item = {}) {
+  const pieces = [
+    item.type,
+    item.name,
+    item.command,
+    item.status,
+    item.text,
+  ].filter(Boolean);
+  return pieces.join(' ') || JSON.stringify(item).slice(0, 500);
+}
+
+function describeServerRequest(msg = {}) {
+  const params = msg.params || {};
+  return [
+    params.tool,
+    params.command,
+    params.reason,
+    params.path,
+  ].filter(Boolean).join(' ') || msg.method;
 }
 
 const tmuxBackend = {
