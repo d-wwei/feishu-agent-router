@@ -89,6 +89,11 @@ farctl allowlist-capture --timeout 120s
 farctl uninstall
 ```
 
+`farctl status` also reports the current active Feishu turn when one exists.
+This is the lightweight completion signal used by operators and monitors:
+`active_turn: none` means the router is not currently processing an inbound
+message in that instance.
+
 Multiple bot instances can run side-by-side by giving each one its own
 Feishu app/profile, instance name, env file, and runtime home:
 
@@ -271,7 +276,7 @@ Feishu UX migration:
 - Replies use Feishu post messages for normal markdown and interactive cards for code blocks/tables
 - Message reactions are added as best-effort phase feedback when the bot has reaction permission
 - Permission cards can be rendered, but button callback handling is not wired until the active `lark-cli` event catalog exposes card action events; text fallback commands remain the safe path
-- Streaming replies default to `FTB_FEISHU_STREAMING=auto`: short replies are sent once as final messages, while likely long/complex tasks start a streaming card after `FTB_FEISHU_STREAM_START_DELAY_MS`; set it to `always` or `off` to override
+- Streaming replies default to `FTB_FEISHU_STREAMING=auto`: short replies are sent once as final messages, while likely long/complex tasks start a streaming card after `FTB_FEISHU_STREAM_START_DELAY_MS`; set it to `always` or `off` to override. Live progress cards preserve the running transcript but insert a `实时进展` heading and paragraph breaks so long Codex status streams are readable in Feishu.
 - When Codex is still cold or prewarming, Router sends one updatable card after `FTB_COLD_START_CARD_DELAY_MS` and patches that same card with the final answer.
 - Router owns replies to the current inbound message. Codex should return final
   text for Router to deliver; direct Feishu/Lark tool calls are reserved for
@@ -309,7 +314,7 @@ FTB_PREWARM_TURN=false
 FTB_CODEX_REQUEST_TIMEOUT_MS=120000
 FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS=90000
 FTB_CODEX_TURN_IDLE_TIMEOUT_MS=300000
-FTB_CODEX_TURN_HARD_TIMEOUT_MS=900000
+FTB_CODEX_TURN_HARD_TIMEOUT_MS=0
 ```
 
 The tmux command also defaults to:
@@ -329,8 +334,10 @@ that adds a local provider override with `wire_api="responses"` and
 never starts producing app-server activity. After the first activity, turns use
 an idle timeout instead of a short absolute completion cutoff: any agent delta,
 tool item, approval request, warning, or error refreshes
-`FTB_CODEX_TURN_IDLE_TIMEOUT_MS`. `FTB_CODEX_TURN_HARD_TIMEOUT_MS` remains as a
-long safety cap for a single Feishu-triggered turn even if activity continues.
+`FTB_CODEX_TURN_IDLE_TIMEOUT_MS`. By default there is no hard wall-clock cap:
+`FTB_CODEX_TURN_HARD_TIMEOUT_MS=0` means a long Feishu-triggered turn can keep
+running as long as Codex keeps producing activity. Set it to a positive number
+only if an instance needs an absolute maximum turn duration.
 `FTB_PREWARM_CODEX=true` starts the app-server and resumes/creates listed Codex
 threads when the bridge starts, so the first Feishu message no longer pays the
 process/thread cold-start cost. Each app-server turn logs `appServerReadyMs`,

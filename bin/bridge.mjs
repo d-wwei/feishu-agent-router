@@ -74,6 +74,7 @@ const SEEN_PATH = path.join(DATA_DIR, 'seen.json');
 const SESSIONS_PATH = path.join(DATA_DIR, 'sessions.json');
 const ROUTES_PATH = path.join(DATA_DIR, 'routes.json');
 const USER_CONTEXT_PATH = path.join(DATA_DIR, 'user-context.json');
+const ACTIVE_TURN_PATH = path.join(DATA_DIR, 'active-turn.json');
 const AUDIT_PATH = path.join(LOG_DIR, 'audit.jsonl');
 const LOG_PATH = path.join(LOG_DIR, 'router.log');
 
@@ -113,7 +114,7 @@ const cfg = {
   codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
   codexFirstOutputTimeoutMs: intEnv('FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', 90_000),
   codexTurnIdleTimeoutMs: intEnv('FTB_CODEX_TURN_IDLE_TIMEOUT_MS', 300_000),
-  codexTurnHardTimeoutMs: intEnv('FTB_CODEX_TURN_HARD_TIMEOUT_MS', 900_000),
+  codexTurnHardTimeoutMs: nonNegativeIntEnv('FTB_CODEX_TURN_HARD_TIMEOUT_MS', 0),
   codexExecTimeoutMs: intEnv('FTB_CODEX_EXEC_TIMEOUT_MS', 120_000),
   codexProfile: env('FTB_CODEX_PROFILE', ''),
   codexModel: env('FTB_CODEX_MODEL', ''),
@@ -154,6 +155,7 @@ let prewarmState = {
 };
 validateExplicitLarkBotConfig();
 const larkBotLock = acquireLarkBotLock();
+clearStartupActiveTurn();
 
 log(`starting router`, { root: ROOT, home: HOME_DIR, larkProfile: cfg.larkProfile || undefined, larkAppId: cfg.larkAppId || undefined });
 if (cfg.idleStopMs > 0) {
@@ -217,16 +219,22 @@ function intEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function nonNegativeIntEnv(name, fallback) {
+  const value = Number.parseInt(env(name, String(fallback)), 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function loadState() {
   const sessions = readJson(SESSIONS_PATH, null) || defaultSessions();
   const routes = readJson(ROUTES_PATH, null) || defaultRoutes();
   const userContext = readJson(USER_CONTEXT_PATH, {});
+  const activeTurn = readJson(ACTIVE_TURN_PATH, null);
   const seen = readJson(SEEN_PATH, []);
   writeJson(SESSIONS_PATH, sessions);
   writeJson(ROUTES_PATH, routes);
   writeJson(USER_CONTEXT_PATH, userContext);
   writeJson(SEEN_PATH, seen);
-  return { sessions, routes, userContext, seen };
+  return { sessions, routes, userContext, activeTurn, seen };
 }
 
 function reloadState() {
@@ -824,6 +832,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const timing = createTurnTiming();
   let backendName = session.backend;
   let stream = null;
+  const activeTurnId = startActiveTurn(event, sessionName, content);
   try {
     const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
     const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
@@ -872,6 +881,47 @@ async function sendToSession(event, sessionName, content, opts = {}) {
       backend: backendName,
       error: error.message || String(error),
     });
+  } finally {
+    clearActiveTurn(activeTurnId);
+  }
+}
+
+function startActiveTurn(event, sessionName, content) {
+  const activeTurn = {
+    id: crypto.randomUUID(),
+    sessionName,
+    messageId: event.message_id || event.id || '',
+    chatId: event.chat_id || '',
+    senderId: event.sender_id || '',
+    startedAt: now(),
+    updatedAt: now(),
+    contentPreview: String(content || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+  };
+  state.activeTurn = activeTurn;
+  writeJson(ACTIVE_TURN_PATH, activeTurn);
+  return activeTurn.id;
+}
+
+function clearActiveTurn(activeTurnId) {
+  const activeTurn = readJson(ACTIVE_TURN_PATH, null);
+  if (activeTurn?.id && activeTurn.id !== activeTurnId) return;
+  state.activeTurn = null;
+  try {
+    fs.unlinkSync(ACTIVE_TURN_PATH);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      log('active turn cleanup failed', { error: error.message || String(error) });
+    }
+  }
+}
+
+function clearStartupActiveTurn() {
+  try {
+    fs.unlinkSync(ACTIVE_TURN_PATH);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      log('startup active turn cleanup failed', { error: error.message || String(error) });
+    }
   }
 }
 

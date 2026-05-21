@@ -138,6 +138,13 @@ function status() {
   console.log(`plist: ${PLIST_PATH}`);
   console.log(`env: ${ENV_PATH}`);
   console.log(`home: ${FTB_HOME}`);
+  const activeTurn = readJson(path.join(FTB_HOME, 'data', 'active-turn.json'), null);
+  if (activeTurn) {
+    console.log(`active_turn: ${activeTurn.sessionName || '-'} message=${activeTurn.messageId || '-'} started=${activeTurn.startedAt || '-'}`);
+    if (activeTurn.contentPreview) console.log(`active_preview: ${activeTurn.contentPreview}`);
+  } else {
+    console.log('active_turn: none');
+  }
 }
 
 function logs(args) {
@@ -233,6 +240,14 @@ function durationMs(value) {
   if (unit === 'm') return amount * 60_000;
   if (unit === 'h') return amount * 3_600_000;
   return amount * 1_000;
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
 }
 
 function bootstrap() {

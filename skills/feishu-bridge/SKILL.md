@@ -64,6 +64,11 @@ Important options:
 - `--set KEY=VALUE`: override any generated `FTB_*` env key.
 - `--force`: rewrite an existing generated env file.
 
+Generated instances default to `FTB_CODEX_TURN_HARD_TIMEOUT_MS=0`, which disables
+the absolute wall-clock cap. Long Feishu-triggered Codex turns keep running as
+long as Codex keeps producing activity; `FTB_CODEX_TURN_IDLE_TIMEOUT_MS` is the
+stuck-turn guard.
+
 Do not put app secrets in command-line arguments. Use `--bot-app-secret-stdin` or `--bot-app-secret-env` only when creating a profile. The generated router env stores profile/app ID, not the app secret.
 
 `FTB_ALLOWED_SENDERS` uses `im.message.receive_v1.sender_id`, which is a Feishu `open_id`. `open_id` is app-scoped, so changing the bot/app can change the same user's ID. After creating a new bot profile, run:

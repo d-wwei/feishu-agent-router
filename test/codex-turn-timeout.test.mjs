@@ -45,7 +45,33 @@ test('turn activity clears first-activity timeout and refreshes idle timeout', (
   assert.equal(timeouts[0].error.diagnostics.lastAgentTextPreview, 'working');
 });
 
-test('hard timeout is not refreshed by activity', () => {
+test('hard timeout is disabled when configured as 0', () => {
+  const clock = new FakeClock();
+  const turn = { threadId: 'thread_1', turnId: 'turn_1', startedAt: 0 };
+  const timeouts = [];
+  const controller = new CodexTurnTimeoutController({
+    turn,
+    firstActivityTimeoutMs: 90_000,
+    idleTimeoutMs: 300_000,
+    hardTimeoutMs: 0,
+    now: () => clock.now,
+    setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+    clearTimeout: (id) => clock.clearTimeout(id),
+    onTimeout: (kind, error) => timeouts.push({ kind, error }),
+  });
+
+  controller.start();
+  clock.tick(30_000);
+  controller.recordActivity('item/agentMessage/delta', 'started');
+  for (let i = 0; i < 8; i += 1) {
+    clock.tick(250_000);
+    controller.recordActivity('item/tool/call', `step ${i}`);
+  }
+
+  assert.deepEqual(timeouts, []);
+});
+
+test('explicit hard timeout is not refreshed by activity', () => {
   const clock = new FakeClock();
   const turn = { threadId: 'thread_1', turnId: 'turn_1', startedAt: 0 };
   const timeouts = [];

@@ -9,6 +9,7 @@ import {
   buildPostContent,
   buildStreamingCardContent,
   formatElapsed,
+  formatStreamingTranscript,
   hasComplexMarkdown,
   preprocessFeishuMarkdown,
 } from '../lib/feishu-render.mjs';
@@ -85,6 +86,31 @@ test('buildStreamingCardContent renders thinking state and tool progress', () =>
   assert.match(markdown, /\[Running\] `shell`/);
 });
 
+test('formatStreamingTranscript separates long live progress without changing code fences', () => {
+  const input = [
+    '我会先读取测试策略。接下来我会启动 daemon。现在执行核心命令。',
+    '```bash',
+    'echo "a.b"',
+    '```',
+    '已拿到结果。下一步写报告。',
+  ].join('\n');
+
+  const output = formatStreamingTranscript(input);
+
+  assert.match(output, /读取测试策略。\n\n接下来我会启动 daemon。\n\n现在执行核心命令。/);
+  assert.match(output, /```bash\necho "a\.b"\n```/);
+  assert.match(output, /已拿到结果。\n\n下一步写报告。/);
+});
+
+test('buildStreamingCardContent adds a readable live progress heading', () => {
+  const payload = buildStreamingCardContent('我会先检查。接下来执行测试。');
+  const card = parsePayload(payload);
+  const markdown = card.body.elements[0].content;
+
+  assert.match(markdown, /^\*\*实时进展\*\*/);
+  assert.match(markdown, /我会先检查。\n\n接下来执行测试。/);
+});
+
 test('buildFinalCardContent renders final markdown and footer', () => {
   const payload = buildFinalCardContent('done', {
     tools: [{ name: 'test', status: 'complete' }],
@@ -104,4 +130,3 @@ test('formatElapsed formats common durations', () => {
   assert.equal(formatElapsed(1500), '1.5s');
   assert.equal(formatElapsed(62_000), '1m 2s');
 });
-
