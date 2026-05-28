@@ -166,6 +166,9 @@ By default, state can live under `FTB_HOME`:
     audit.jsonl
 ```
 
+For real Feishu release checks that cannot run in `npm test`, use
+[test/REAL_FEISHU_CANARY.md](test/REAL_FEISHU_CANARY.md).
+
 ## Routing Model
 
 Resolution order:

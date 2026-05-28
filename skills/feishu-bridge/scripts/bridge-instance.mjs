@@ -32,10 +32,11 @@ function main() {
 
   const instanceName = sanitizeInstanceName(args.options.name || process.env.FTB_INSTANCE_NAME || 'default');
   const registryEntry = readRegistryEntry(instanceName);
+  const plistEntry = command === 'init' || command === 'print-env' ? null : readLaunchdPlistEntry(instanceName);
   const fileName = instanceName || 'default';
   const baseCwd = path.resolve(args.options.cwd || process.cwd());
-  const envPath = path.resolve(args.options.env || registryEntry?.envPath || path.join(baseCwd, '.feishu-bridge', `${fileName}.env`));
-  const homePath = path.resolve(args.options.home || registryEntry?.homePath || defaultHome(instanceName));
+  const envPath = path.resolve(args.options.env || plistEntry?.envPath || registryEntry?.envPath || path.join(baseCwd, '.feishu-bridge', `${fileName}.env`));
+  const homePath = path.resolve(args.options.home || plistEntry?.homePath || registryEntry?.homePath || defaultHome(instanceName));
 
   if (command === 'print-env') {
     rejectUnexpectedRest(command);
@@ -125,6 +126,36 @@ function readRegistryEntry(instanceName) {
   if (!entry || typeof entry !== 'object') return null;
   if (!entry.envPath || !entry.homePath) return null;
   return entry;
+}
+
+function readLaunchdPlistEntry(instanceName) {
+  const plistPath = path.join(
+    os.homedir(),
+    'Library',
+    'LaunchAgents',
+    `${instanceName ? `com.feishu-agent-router.${instanceName}` : 'com.feishu-agent-router'}.plist`,
+  );
+  if (!fs.existsSync(plistPath)) return null;
+  const text = fs.readFileSync(plistPath, 'utf8');
+  const envPath = plistStringValue(text, 'FTB_ENV_PATH');
+  const homePath = plistStringValue(text, 'FTB_HOME');
+  if (!envPath && !homePath) return null;
+  return { envPath, homePath };
+}
+
+function plistStringValue(text, key) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(text).match(new RegExp(`<key>${escaped}</key>\\s*<string>([^<]*)</string>`));
+  return match ? unxml(match[1]) : '';
+}
+
+function unxml(value) {
+  return String(value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }
 
 function saveRegistryEntry({ instanceName, envPath, homePath, routerRoot, baseCwd }) {

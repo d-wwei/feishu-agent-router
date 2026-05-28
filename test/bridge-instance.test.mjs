@@ -117,6 +117,55 @@ test('bridge-instance reuses registered env and home for named instances from an
   assert.doesNotMatch(status.stdout, new RegExp(escapeRegExp(path.join(secondCwd, '.feishu-bridge', 'sales.env'))));
 });
 
+test('bridge-instance prefers existing launchd plist env and home over cwd defaults', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-instance-plist-'));
+  const home = path.join(tmp, 'home');
+  const cwd = path.join(tmp, 'cwd');
+  const plistDir = path.join(home, 'Library', 'LaunchAgents');
+  const actualEnv = path.join(tmp, 'actual.env');
+  const actualHome = path.join(tmp, 'actual-home');
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(plistDir, { recursive: true });
+  fs.writeFileSync(actualEnv, [
+    'FTB_LARK_PROFILE=sales-bot',
+    'FTB_LARK_APP_ID=cli_sales',
+    'FTB_ALLOWED_SENDERS=ou_sales',
+    'FTB_ADMIN_USERS=ou_admin',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(plistDir, 'com.feishu-agent-router.sales.plist'), [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<plist version="1.0"><dict>',
+    '<key>EnvironmentVariables</key><dict>',
+    '<key>FTB_ENV_PATH</key>',
+    `<string>${actualEnv}</string>`,
+    '<key>FTB_HOME</key>',
+    `<string>${actualHome}</string>`,
+    '<key>FTB_INSTANCE_NAME</key>',
+    '<string>sales</string>',
+    '</dict>',
+    '</dict></plist>',
+    '',
+  ].join('\n'));
+
+  const status = spawnSync(process.execPath, [
+    bridgeInstance,
+    'status',
+    '--name',
+    'sales',
+    '--dry-run',
+  ], {
+    encoding: 'utf8',
+    cwd,
+    env: { ...process.env, HOME: home },
+  });
+
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, new RegExp(`--env ${escapeRegExp(actualEnv)}`));
+  assert.match(status.stdout, new RegExp(`--home ${escapeRegExp(actualHome)}`));
+  assert.doesNotMatch(status.stdout, new RegExp(escapeRegExp(path.join(cwd, '.feishu-bridge', 'sales.env'))));
+});
+
 test('bridge-instance refuses to start without access and admin policies', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-instance-policy-'));
   const home = path.join(tmp, 'home');

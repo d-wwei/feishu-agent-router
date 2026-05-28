@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "run_id": "run-codex-4b7e-001-20260528T161206+0800",
+  "tester_id": "codex-4b7e",
+  "project": "feishu-agent-router",
+  "git_base": "a9d3c8b",
+  "worktree_state": "main...origin/main with uncommitted test-coverage additions",
+  "started_at": "2026-05-28T16:11:11+08:00",
+  "completed_at": "2026-05-28T16:12:06+08:00",
+  "overall": "pass_with_manual_gap",
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "skipped": 1
+  },
+  "checks": [
+    {
+      "id": "AUTO-001",
+      "group": "full-regression",
+      "command": "npm test",
+      "status": "pass",
+      "evidence": "86 tests, 86 pass, 0 fail"
+    },
+    {
+      "id": "AUTO-002",
+      "group": "syntax",
+      "command": "npm run check",
+      "status": "pass",
+      "evidence": "all node --check targets exited 0"
+    },
+    {
+      "id": "AUTO-003",
+      "group": "git-whitespace",
+      "command": "git diff --check",
+      "status": "pass",
+      "evidence": "exit 0"
+    },
+    {
+      "id": "STATIC-001",
+      "group": "static-scan",
+      "command": "rg scan for stale half-implemented patterns",
+      "status": "pass",
+      "evidence": "no active stale /perm, callbackData, genericDownloadFallback, old env defaults, or content-bearing allowlist capture found"
+    },
+    {
+      "id": "RUNTIME-001",
+      "group": "runtime-status",
+      "command": "bridge-instance status for default and rsopend-tester",
+      "status": "pass",
+      "evidence": "both services running, active_turn: none"
+    },
+    {
+      "id": "MANUAL-001",
+      "group": "real-feishu-canary",
+      "command": "test/REAL_FEISHU_CANARY.md",
+      "status": "skip",
+      "evidence": "requires real Feishu client and bot credentials; checklist created but not executed"
+    }
+  ],
+  "bugs": [],
+  "residual_risks": [
+    "Real Feishu canary checklist was not executed in this run.",
+    "Report covers current working tree, including uncommitted coverage additions."
+  ]
+}
+
