@@ -9,6 +9,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import {
   createInboxEntryLike,
+  hydrateMergeForwardEvent,
   normalizeInboundEvent,
 } from '../lib/feishu-ingest.mjs';
 import {
@@ -547,7 +548,7 @@ async function runCodexWarmupTurn() {
 
 async function handleEvent(event) {
   reloadState();
-  const normalized = normalizeInboundEvent(event);
+  let normalized = normalizeInboundEvent(event);
   const messageId = normalized.messageId || event.message_id || event.id;
   const dedupKey = normalized.eventId || event.event_id || messageId;
   if (!messageId || !dedupKey) return;
@@ -573,27 +574,14 @@ async function handleEvent(event) {
     return;
   }
 
-  const content = normalized.text || String(event.content || '').trim();
-  audit('inbound', event, {
-    content: content.slice(0, 500),
-    messageType: normalized.messageType,
-    downloadPlans: normalized.downloadPlans.length,
-    mergeForward: normalized.mergeForward?.status || '',
-  });
-  log(`received message`, {
-    messageId,
-    sender: shortId(event.sender_id),
-    chat: shortId(event.chat_id),
-    type: normalized.messageType,
-    content: content.slice(0, 80),
-  });
-
+  let content = normalized.text || String(event.content || '').trim();
   if (!content) {
     await reply(messageId, '收到空消息，已忽略。');
     return;
   }
 
   if (isCommand(content)) {
+    recordInboundMessage(event, normalized, content);
     await handleCommand(event, content);
     return;
   }
@@ -602,6 +590,28 @@ async function handleEvent(event) {
     log(`ignored plain group message`, { messageId, chat: shortId(event.chat_id) });
     return;
   }
+
+  const hydrated = hydrateMergeForwardEvent(event, {
+    normalized,
+    as: cfg.larkAs,
+    profile: cfg.larkProfile,
+    cwd: ROOT,
+  });
+  if (hydrated.fetchResult) {
+    log('merge_forward fetch completed', {
+      messageId,
+      status: hydrated.fetchResult.status,
+      fetchedItems: hydrated.fetchResult.items?.length || 0,
+      ok: hydrated.fetchResult.ok,
+      error: hydrated.fetchResult.error || '',
+      failure: hydrated.fetchResult.failureSummary || '',
+    });
+  }
+  event = hydrated.event;
+  normalized = hydrated.normalized;
+  content = normalized.text || String(event.content || '').trim();
+
+  recordInboundMessage(event, normalized, content);
 
   await sendToResolvedSession(event, content, {
     normalized,
@@ -616,6 +626,46 @@ function isAdmin(event) {
 
 function isCommand(content) {
   return content.startsWith('/');
+}
+
+function recordInboundMessage(event, normalized, content) {
+  audit('inbound', event, {
+    content: auditContentPreview(normalized, content),
+    messageType: normalized.messageType,
+    downloadPlans: normalized.downloadPlans.length,
+    mergeForward: normalized.mergeForward?.status || '',
+  });
+  log(`received message`, {
+    messageId: normalized.messageId || event.message_id || event.id,
+    sender: shortId(event.sender_id),
+    chat: shortId(event.chat_id),
+    type: normalized.messageType,
+    content: logContentPreview(normalized, content),
+  });
+}
+
+function auditContentPreview(normalized, content) {
+  if (normalized?.messageType === 'merge_forward') {
+    return mergeForwardContentPreview(normalized);
+  }
+  return String(content || '').slice(0, 500);
+}
+
+function logContentPreview(normalized, content) {
+  if (normalized?.messageType === 'merge_forward') {
+    return mergeForwardContentPreview(normalized);
+  }
+  return String(content || '').slice(0, 80);
+}
+
+function mergeForwardContentPreview(normalized) {
+  const merge = normalized?.mergeForward || {};
+  return [
+    '[merge_forward]',
+    `status=${merge.status || 'unknown'}`,
+    merge.childCount !== undefined ? `children=${merge.childCount}` : '',
+    `downloadPlans=${normalized?.downloadPlans?.length || 0}`,
+  ].filter(Boolean).join(' ');
 }
 
 function shouldSaveInbox(normalized) {
@@ -832,7 +882,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const timing = createTurnTiming();
   let backendName = session.backend;
   let stream = null;
-  const activeTurnId = startActiveTurn(event, sessionName, content);
+  const activeTurnId = startActiveTurn(event, sessionName, content, opts.normalized);
   try {
     const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
     const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
@@ -886,7 +936,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   }
 }
 
-function startActiveTurn(event, sessionName, content) {
+function startActiveTurn(event, sessionName, content, normalized = null) {
   const activeTurn = {
     id: crypto.randomUUID(),
     sessionName,
@@ -895,11 +945,18 @@ function startActiveTurn(event, sessionName, content) {
     senderId: event.sender_id || '',
     startedAt: now(),
     updatedAt: now(),
-    contentPreview: String(content || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+    contentPreview: activeTurnContentPreview(normalized, content),
   };
   state.activeTurn = activeTurn;
   writeJson(ACTIVE_TURN_PATH, activeTurn);
   return activeTurn.id;
+}
+
+function activeTurnContentPreview(normalized, content) {
+  if (normalized?.messageType === 'merge_forward') {
+    return mergeForwardContentPreview(normalized);
+  }
+  return String(content || '').replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
 function clearActiveTurn(activeTurnId) {
@@ -1850,6 +1907,7 @@ function createInboxEntry(event, normalized) {
     inboxRoot: INBOX_DIR,
     larkAs: cfg.larkAs,
     larkProfile: cfg.larkProfile,
+    normalized,
     download: true,
   });
   const effective = normalized || entry.normalized;

@@ -5,10 +5,13 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  buildMergeForwardGetArgs,
   buildLarkCliResourceDownloadArgs,
   buildMergeForwardFetchArgs,
   createInboxEntryLike,
   extractFileKey,
+  fetchMergeForwardItemsWithLarkCli,
+  hydrateMergeForwardEvent,
   normalizeInboundEvent,
   parsePostContent,
   parseTextContent,
@@ -127,7 +130,184 @@ test('normalizeInboundEvent parses merge_forward children and excludes audio tra
 test('merge_forward without children exposes lark-cli fetch integration point', () => {
   const normalized = normalizeInboundEvent({ message_id: 'om_mf', message_type: 'merge_forward' });
   assert.equal(normalized.mergeForward.status, 'needs_fetch');
-  assert.deepEqual(normalized.mergeForward.fetchArgs, buildMergeForwardFetchArgs('om_mf'));
+  assert.deepEqual(normalized.mergeForward.fetchArgs, buildMergeForwardGetArgs('om_mf'));
+  assert.deepEqual(normalized.mergeForward.mgetDiagnosticArgs, buildMergeForwardFetchArgs('om_mf'));
+});
+
+test('buildMergeForwardGetArgs fetches merge_forward children through raw message get API', () => {
+  assert.deepEqual(
+    buildMergeForwardGetArgs('om_mf', { as: 'bot', profile: 'sales-bot' }),
+    ['--profile', 'sales-bot', 'api', 'GET', '/open-apis/im/v1/messages/om_mf', '--as', 'bot'],
+  );
+});
+
+test('hydrateMergeForwardEvent fetches and parses merge_forward children', () => {
+  const hydrated = hydrateMergeForwardEvent(
+    { message_id: 'om_parent', message_type: 'merge_forward', chat_id: 'oc1', sender_id: 'ou_sender' },
+    {
+      fetchMergeForwardItems() {
+        return {
+          ok: true,
+          status: 0,
+          signal: null,
+          stdout: '{}',
+          stderr: '',
+          args: [],
+          items: [
+            { message_id: 'om_parent', msg_type: 'merge_forward', body: { content: '{}' } },
+            {
+              message_id: 'om_child_1',
+              upper_message_id: 'om_parent',
+              sender: { sender_id: { open_id: 'ou_a' }, name: 'Leaf' },
+              msg_type: 'text',
+              body: { content: '{"text":"hi"}' },
+            },
+            {
+              message_id: 'om_child_2',
+              upper_message_id: 'om_parent',
+              sender: { sender_id: { open_id: 'ou_b' }, name: 'Eli' },
+              msg_type: 'file',
+              body: { content: '{"file_key":"file_1","name":"spec.pdf"}' },
+            },
+          ],
+        };
+      },
+    },
+  );
+
+  assert.equal(hydrated.fetched, true);
+  assert.equal(hydrated.normalized.mergeForward.status, 'parsed');
+  assert.equal(hydrated.normalized.mergeForward.childCount, 2);
+  assert.match(hydrated.normalized.text, /Leaf: hi/);
+  assert.match(hydrated.normalized.text, /Eli: \[文件: file_1\]/);
+  assert.deepEqual(hydrated.normalized.downloadPlans, [{
+    messageId: 'om_child_2',
+    fileKey: 'file_1',
+    messageType: 'file',
+    resourceType: 'file',
+    label: 'file',
+    suggestedName: 'spec.pdf',
+  }]);
+});
+
+test('hydrateMergeForwardEvent resolves sender names when fetched items only include open_id', () => {
+  const seen = [];
+  const hydrated = hydrateMergeForwardEvent(
+    { message_id: 'om_parent', message_type: 'merge_forward' },
+    {
+      fetchMergeForwardItems() {
+        return {
+          ok: true,
+          status: 0,
+          signal: null,
+          stdout: '{}',
+          stderr: '',
+          args: [],
+          items: [
+            { message_id: 'om_parent', msg_type: 'merge_forward', body: { content: '{}' } },
+            {
+              message_id: 'om_child_1',
+              upper_message_id: 'om_parent',
+              sender: { sender_id: { open_id: 'ou_leaf' } },
+              msg_type: 'text',
+              body: { content: '{"text":"hi"}' },
+            },
+          ],
+        };
+      },
+      resolveUserName(openId) {
+        seen.push(openId);
+        return openId === 'ou_leaf' ? 'Leaf' : null;
+      },
+    },
+  );
+
+  assert.deepEqual(seen, ['ou_leaf']);
+  assert.match(hydrated.normalized.text, /Leaf: hi/);
+});
+
+test('fetchMergeForwardItemsWithLarkCli parses raw API data.items output', () => {
+  const calls = [];
+  const result = fetchMergeForwardItemsWithLarkCli('om_parent', {
+    as: 'bot',
+    profile: 'sales-bot',
+    spawnSync(command, args) {
+      calls.push({ command, args });
+      return {
+        status: 0,
+        signal: null,
+        stdout: JSON.stringify({
+          code: 0,
+          data: {
+            items: [
+              { message_id: 'om_parent', msg_type: 'merge_forward' },
+              { message_id: 'om_child', upper_message_id: 'om_parent', msg_type: 'text', body: { content: '{"text":"ok"}' } },
+            ],
+          },
+        }),
+        stderr: '',
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.items.length, 2);
+  assert.equal(calls[0].command, 'lark-cli');
+  assert.deepEqual(calls[0].args, [
+    '--profile',
+    'sales-bot',
+    'api',
+    'GET',
+    '/open-apis/im/v1/messages/om_parent',
+    '--as',
+    'bot',
+  ]);
+});
+
+test('hydrateMergeForwardEvent reports actionable fetch failures', () => {
+  const hydrated = hydrateMergeForwardEvent(
+    { message_id: 'om_parent', message_type: 'merge_forward' },
+    {
+      fetchMergeForwardItems() {
+        return {
+          ok: false,
+          status: 1,
+          signal: null,
+          stdout: '',
+          stderr: 'permission denied: missing im:message.group_msg',
+          args: [],
+          items: [],
+        };
+      },
+    },
+  );
+
+  assert.equal(hydrated.normalized.mergeForward.status, 'fetch_failed');
+  assert.match(hydrated.normalized.text, /无法获取子消息内容/);
+  assert.match(hydrated.normalized.text, /im:message\.group_msg/);
+  assert.match(hydrated.normalized.unsupportedReasons.at(-1), /permission denied/);
+});
+
+test('hydrateMergeForwardEvent failure text does not expose raw stdout message content', () => {
+  const hydrated = hydrateMergeForwardEvent(
+    { message_id: 'om_parent', message_type: 'merge_forward' },
+    {
+      fetchMergeForwardItems() {
+        return {
+          ok: false,
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify({ data: { items: [{ body: { content: '{"text":"secret transcript"}' } }] } }),
+          stderr: '',
+          args: [],
+          items: [],
+        };
+      },
+    },
+  );
+
+  assert.match(hydrated.normalized.text, /无法获取子消息内容/);
+  assert.doesNotMatch(hydrated.normalized.text, /secret transcript/);
 });
 
 test('buildLarkCliResourceDownloadArgs includes file-key without exposing secrets', () => {
@@ -193,4 +373,45 @@ test('createInboxEntryLike writes normalized materials and manifest', () => {
   ]);
   assert.ok(fs.existsSync(path.join(entry.dir, 'content.md')));
   assert.ok(fs.existsSync(path.join(entry.dir, 'manifest.json')));
+});
+
+test('createInboxEntryLike can persist pre-hydrated merge_forward content', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-ingest-'));
+  const hydrated = hydrateMergeForwardEvent(
+    { message_id: 'om_parent', message_type: 'merge_forward' },
+    {
+      fetchMergeForwardItems() {
+        return {
+          ok: true,
+          status: 0,
+          signal: null,
+          stdout: '{}',
+          stderr: '',
+          args: [],
+          items: [
+            { message_id: 'om_parent', msg_type: 'merge_forward', body: { content: '{}' } },
+            {
+              message_id: 'om_child_1',
+              upper_message_id: 'om_parent',
+              sender: { sender_id: { open_id: 'ou_a' }, name: 'Leaf' },
+              msg_type: 'text',
+              body: { content: '{"text":"ship it"}' },
+            },
+          ],
+        };
+      },
+    },
+  );
+
+  const entry = createInboxEntryLike(
+    { message_id: 'om_parent', message_type: 'merge_forward' },
+    {
+      inboxRoot: root,
+      now: new Date('2026-05-20T00:00:00Z'),
+      normalized: hydrated.normalized,
+    },
+  );
+
+  assert.equal(entry.manifest.mergeForward.status, 'parsed');
+  assert.match(fs.readFileSync(path.join(entry.dir, 'content.md'), 'utf8'), /Leaf: ship it/);
 });

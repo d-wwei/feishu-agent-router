@@ -257,10 +257,15 @@ Phase 1: router MVP
 Phase 2: office materials
 
 - Inbound text/post/image/file/video/merge-forward messages are normalized
+- Merge-forward messages are expanded by fetching child messages through
+  `GET /open-apis/im/v1/messages/{message_id}` before they are sent to Codex
 - Non-text and `/file` messages are saved under `inbox/`
 - `message.json`, `content.md`, and `manifest.json` are created
 - The router tries Feishu official resource download for image/file/video attachments
 - Local inbox paths are passed to the backend session
+- Merge-forward parsing requires the bot/profile to have message-read access to
+  the source chat; common missing scopes are `im:message.group_msg` and
+  `contact:user.base:readonly`
 - Voice transcription is intentionally not included in this phase
 
 Phase 3: multi-agent routing
