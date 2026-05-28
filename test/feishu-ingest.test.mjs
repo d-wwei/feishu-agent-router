@@ -5,11 +5,14 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  buildMessageGetArgs,
   buildMergeForwardGetArgs,
   buildLarkCliResourceDownloadArgs,
   buildMergeForwardFetchArgs,
   createInboxEntryLike,
   extractFileKey,
+  fetchMessageWithLarkCli,
+  hydrateAttachmentEvent,
   fetchMergeForwardItemsWithLarkCli,
   hydrateMergeForwardEvent,
   normalizeInboundEvent,
@@ -96,6 +99,88 @@ test('normalizeInboundEvent builds download plans for post images', () => {
   }]);
 });
 
+test('normalizeInboundEvent builds post media download plans from media file keys, not cover images', () => {
+  const normalized = normalizeInboundEvent({
+    message_id: 'om_post_media',
+    message_type: 'post',
+    content: JSON.stringify({
+      content: [[
+        { tag: 'media', media_type: 'video', file_key: 'video_file', image_key: 'cover_img' },
+        { tag: 'media', media_type: 'file', file_key: 'doc_file', name: 'brief.pdf' },
+        { tag: 'media', media_type: 'image', image_key: 'inline_img' },
+      ]],
+    }),
+  });
+
+  assert.deepEqual(normalized.downloadPlans, [
+    {
+      messageId: 'om_post_media',
+      fileKey: 'video_file',
+      messageType: 'video',
+      resourceType: 'file',
+      label: 'video',
+      suggestedName: 'video-video_file',
+    },
+    {
+      messageId: 'om_post_media',
+      fileKey: 'doc_file',
+      messageType: 'file',
+      resourceType: 'file',
+      label: 'file',
+      suggestedName: 'brief.pdf',
+    },
+    {
+      messageId: 'om_post_media',
+      fileKey: 'inline_img',
+      messageType: 'image',
+      resourceType: 'image',
+      label: 'image',
+      suggestedName: 'image-inline_img',
+    },
+  ]);
+});
+
+test('hydrateAttachmentEvent fetches raw body.content when image event omits file key', () => {
+  const event = {
+    message_id: 'om_img',
+    message_type: 'image',
+    content: '{}',
+  };
+  const before = normalizeInboundEvent(event);
+  assert.deepEqual(before.downloadPlans, []);
+
+  const hydrated = hydrateAttachmentEvent(event, {
+    normalized: before,
+    fetchMessage(messageId) {
+      assert.equal(messageId, 'om_img');
+      return {
+        ok: true,
+        status: 0,
+        signal: null,
+        stdout: '{}',
+        stderr: '',
+        args: [],
+        message: {
+          message_id: 'om_img',
+          msg_type: 'image',
+          body: { content: '{"image_key":"img_from_raw"}' },
+        },
+      };
+    },
+  });
+
+  assert.equal(hydrated.fetched, true);
+  assert.equal(hydrated.normalized.attachmentFetch.status, 'ok');
+  assert.deepEqual(hydrated.normalized.downloadPlans, [{
+    messageId: 'om_img',
+    fileKey: 'img_from_raw',
+    messageType: 'image',
+    resourceType: 'image',
+    label: 'image',
+    suggestedName: 'image-img_from_raw',
+  }]);
+});
+
 test('normalizeInboundEvent parses merge_forward children and excludes audio transcription', () => {
   const normalized = normalizeInboundEvent({
     message_id: 'om_parent',
@@ -139,6 +224,54 @@ test('buildMergeForwardGetArgs fetches merge_forward children through raw messag
     buildMergeForwardGetArgs('om_mf', { as: 'bot', profile: 'sales-bot' }),
     ['--profile', 'sales-bot', 'api', 'GET', '/open-apis/im/v1/messages/om_mf', '--as', 'bot'],
   );
+});
+
+test('fetchMessageWithLarkCli parses raw message get body.content output', () => {
+  const calls = [];
+  const result = fetchMessageWithLarkCli('om_file', {
+    as: 'bot',
+    profile: 'sales-bot',
+    spawnSync(command, args) {
+      calls.push({ command, args });
+      return {
+        status: 0,
+        signal: null,
+        stdout: JSON.stringify({
+          code: 0,
+          data: {
+            items: [{
+              message_id: 'om_file',
+              msg_type: 'file',
+              body: { content: '{"file_key":"file_from_raw","name":"raw.pdf"}' },
+            }],
+          },
+        }),
+        stderr: '',
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.message.body.content, '{"file_key":"file_from_raw","name":"raw.pdf"}');
+  assert.equal(calls[0].command, 'lark-cli');
+  assert.deepEqual(calls[0].args, buildMessageGetArgs('om_file', { as: 'bot', profile: 'sales-bot' }));
+});
+
+test('fetchMessageWithLarkCli treats nonzero API code as failure', () => {
+  const result = fetchMessageWithLarkCli('om_file', {
+    spawnSync() {
+      return {
+        status: 0,
+        signal: null,
+        stdout: JSON.stringify({ code: 99991672, msg: 'permission denied', data: {} }),
+        stderr: '',
+      };
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.message, null);
+  assert.match(result.failureSummary, /permission denied|99991672/);
 });
 
 test('hydrateMergeForwardEvent fetches and parses merge_forward children', () => {
@@ -373,6 +506,13 @@ test('createInboxEntryLike writes normalized materials and manifest', () => {
   ]);
   assert.ok(fs.existsSync(path.join(entry.dir, 'content.md')));
   assert.ok(fs.existsSync(path.join(entry.dir, 'manifest.json')));
+  assert.equal(modeOf(root), 0o700);
+  assert.equal(modeOf(path.dirname(entry.dir)), 0o700);
+  assert.equal(modeOf(entry.dir), 0o700);
+  assert.equal(modeOf(entry.attachmentsDir), 0o700);
+  assert.equal(modeOf(path.join(entry.dir, 'message.json')), 0o600);
+  assert.equal(modeOf(path.join(entry.dir, 'content.md')), 0o600);
+  assert.equal(modeOf(path.join(entry.dir, 'manifest.json')), 0o600);
 });
 
 test('createInboxEntryLike can persist pre-hydrated merge_forward content', () => {
@@ -415,3 +555,7 @@ test('createInboxEntryLike can persist pre-hydrated merge_forward content', () =
   assert.equal(entry.manifest.mergeForward.status, 'parsed');
   assert.match(fs.readFileSync(path.join(entry.dir, 'content.md'), 'utf8'), /Leaf: ship it/);
 });
+
+function modeOf(file) {
+  return fs.statSync(file).mode & 0o777;
+}

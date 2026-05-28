@@ -7,13 +7,21 @@ import { buildLarkCliArgs, parseLarkProfileList } from '../lib/lark-cli.mjs';
 import { extractIgnoredPolicyEvents } from '../lib/allowlist-policy.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const envPath = process.env.FTB_ENV_PATH ? path.resolve(process.env.FTB_ENV_PATH) : path.join(root, '.env');
+const cli = parseCli(process.argv.slice(2));
+const envPath = cli.options.env
+  ? path.resolve(cli.options.env)
+  : process.env.FTB_ENV_PATH
+    ? path.resolve(process.env.FTB_ENV_PATH)
+    : path.join(root, '.env');
 const envFile = readDotEnv(envPath);
 const cfg = {
   larkAs: env('FTB_LARK_AS', 'bot'),
   larkProfile: env('FTB_LARK_PROFILE', ''),
   larkAppId: env('FTB_LARK_APP_ID', ''),
-  home: env('FTB_HOME', path.join(process.env.HOME || root, '.feishu-agent-router')),
+  home: cli.options.home
+    ? path.resolve(cli.options.home)
+    : env('FTB_HOME', path.join(process.env.HOME || root, '.feishu-agent-router')),
+  instanceName: cli.options.name || process.env.FTB_INSTANCE_NAME || envFile.FTB_INSTANCE_NAME || '',
   allowedSenders: csvEnv('FTB_ALLOWED_SENDERS'),
   allowedChats: csvEnv('FTB_ALLOWED_CHATS'),
 };
@@ -113,7 +121,28 @@ function summarizeIgnoredPolicyLogs() {
     console.log(`  - message=${event.messageId || '-'} reason=${event.reason || 'unknown'} sender=${event.sender || '-'} chat=${event.chat || '-'}`);
   }
   console.log('remediation sender_id is open_id and app-scoped; after changing bot/app, recapture it.');
-  console.log(`remediation run: farctl${process.env.FTB_INSTANCE_NAME ? ` --name ${process.env.FTB_INSTANCE_NAME}` : ''} --env "${envPath}" --home "${cfg.home}" allowlist-capture --timeout 120s`);
+  console.log(`remediation run: farctl${cfg.instanceName ? ` --name ${cfg.instanceName}` : ''} --env "${envPath}" --home "${cfg.home}" allowlist-capture --timeout 120s`);
+}
+
+function parseCli(argv) {
+  const options = {};
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === '--env') {
+      options.env = argv[++i] || '';
+    } else if (token.startsWith('--env=')) {
+      options.env = token.slice('--env='.length);
+    } else if (token === '--home') {
+      options.home = argv[++i] || '';
+    } else if (token.startsWith('--home=')) {
+      options.home = token.slice('--home='.length);
+    } else if (token === '--name') {
+      options.name = argv[++i] || '';
+    } else if (token.startsWith('--name=')) {
+      options.name = token.slice('--name='.length);
+    }
+  }
+  return { options };
 }
 
 function readDotEnv(file) {

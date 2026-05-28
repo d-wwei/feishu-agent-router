@@ -55,25 +55,22 @@ test('buildMessageContent selects post for simple text and card for complex text
   assert.equal(buildMessageContent('| A | B |\n| --- | --- |').msg_type, 'interactive');
 });
 
-test('buildPermissionCardContent includes action buttons and fallback commands', () => {
+test('buildPermissionCardContent renders a non-actionable permission notice', () => {
   const payload = buildPermissionCardContent({
     text: 'Need approval.',
     permissionRequestId: 'perm-123',
     chatId: 'oc_abc',
   });
   const card = parsePayload(payload);
-  const actions = card.elements.find((element) => element.tag === 'action').actions;
 
   assert.equal(payload.msg_type, 'interactive');
   assert.equal(card.header.title.content, 'Permission Required');
-  assert.equal(actions.length, 3);
-  assert.equal(actions[0].value.callbackData, 'perm:allow:perm-123');
-  assert.equal(actions[0].value.callback_data, 'perm:allow:perm-123');
-  assert.equal(actions[0].value.chatId, 'oc_abc');
-  assert.match(card.elements.at(-1).content, /\/perm deny perm-123/);
+  assert.equal(card.elements.some((element) => element.tag === 'action'), false);
+  assert.doesNotMatch(JSON.stringify(card), /\/perm|callbackData|callback_data/);
+  assert.match(card.elements.at(-1).content, /Request ID: `perm-123`/);
 });
 
-test('buildStreamingCardContent renders thinking state and tool progress', () => {
+test('buildStreamingCardContent renders thinking state without unused tool progress', () => {
   const payload = buildStreamingCardContent('', {
     tools: [{ name: 'shell', status: 'running' }],
   });
@@ -83,7 +80,7 @@ test('buildStreamingCardContent renders thinking state and tool progress', () =>
   assert.equal(payload.msg_type, 'interactive');
   assert.equal(card.config.streaming_mode, true);
   assert.match(markdown, /Thinking/);
-  assert.match(markdown, /\[Running\] `shell`/);
+  assert.doesNotMatch(markdown, /\[Running\] `shell`/);
 });
 
 test('formatStreamingTranscript separates long live progress without changing code fences', () => {
@@ -120,7 +117,7 @@ test('buildFinalCardContent renders final markdown and footer', () => {
   const footer = card.body.elements.at(-1);
 
   assert.equal(card.config.streaming_mode, false);
-  assert.match(card.body.elements[0].content, /\[Complete\] `test`/);
+  assert.equal(card.body.elements[0].content, 'done');
   assert.equal(footer.text_size, 'notation');
   assert.equal(footer.content, 'Completed | 1.3s');
 });

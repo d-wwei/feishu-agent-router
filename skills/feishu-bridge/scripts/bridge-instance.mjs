@@ -31,10 +31,11 @@ function main() {
   }
 
   const instanceName = sanitizeInstanceName(args.options.name || process.env.FTB_INSTANCE_NAME || 'default');
+  const registryEntry = readRegistryEntry(instanceName);
   const fileName = instanceName || 'default';
   const baseCwd = path.resolve(args.options.cwd || process.cwd());
-  const envPath = path.resolve(args.options.env || path.join(baseCwd, '.feishu-bridge', `${fileName}.env`));
-  const homePath = path.resolve(args.options.home || defaultHome(instanceName));
+  const envPath = path.resolve(args.options.env || registryEntry?.envPath || path.join(baseCwd, '.feishu-bridge', `${fileName}.env`));
+  const homePath = path.resolve(args.options.home || registryEntry?.homePath || defaultHome(instanceName));
 
   if (command === 'print-env') {
     rejectUnexpectedRest(command);
@@ -48,20 +49,28 @@ function main() {
     requireExplicitBotInfo();
     maybeCreateLarkProfile();
     writeEnvFile({ routerRoot, instanceName, envPath, homePath, baseCwd, force: Boolean(args.options.force) });
+    saveRegistryEntry({ instanceName, envPath, homePath, routerRoot, baseCwd });
     console.log(`env: ${envPath}`);
     console.log(`home: ${homePath}`);
     return;
   }
 
   const farctlCommand = normalizeCommand(command);
-  const shouldEnsureEnv = ['install', 'start', 'restart', 'doctor', 'plist'].includes(farctlCommand);
+  const shouldEnsureEnv = ['install', 'start', 'restart'].includes(farctlCommand);
   if (shouldEnsureEnv && !fs.existsSync(envPath)) {
     requireExplicitBotInfo();
     maybeCreateLarkProfile();
     writeEnvFile({ routerRoot, instanceName, envPath, homePath, baseCwd, force: false });
+    saveRegistryEntry({ instanceName, envPath, homePath, routerRoot, baseCwd });
   }
   if (['install', 'start', 'restart', 'allowlist-capture', 'doctor', 'plist'].includes(farctlCommand)) {
     requireEnvHasExplicitBotInfo(envPath);
+  }
+  if (['install', 'start', 'restart'].includes(farctlCommand)) {
+    requireEnvHasAccessPolicy(envPath);
+  }
+  if (args.options.env || args.options.home || farctlCommand === 'install') {
+    saveRegistryEntry({ instanceName, envPath, homePath, routerRoot, baseCwd });
   }
 
   const farctlArgs = [];
@@ -94,6 +103,46 @@ function resolveRouterRoot(raw) {
   return candidates[0] || REPO_FALLBACK;
 }
 
+function registryPath() {
+  return path.join(os.homedir(), '.feishu-agent-router', 'instances.json');
+}
+
+function registryKey(instanceName) {
+  return instanceName || 'default';
+}
+
+function readRegistry() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(registryPath(), 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function readRegistryEntry(instanceName) {
+  const entry = readRegistry().instances?.[registryKey(instanceName)];
+  if (!entry || typeof entry !== 'object') return null;
+  if (!entry.envPath || !entry.homePath) return null;
+  return entry;
+}
+
+function saveRegistryEntry({ instanceName, envPath, homePath, routerRoot, baseCwd }) {
+  const registryFile = registryPath();
+  const registry = readRegistry();
+  registry.version = 1;
+  registry.instances = registry.instances && typeof registry.instances === 'object' ? registry.instances : {};
+  registry.instances[registryKey(instanceName)] = {
+    envPath,
+    homePath,
+    routerRoot,
+    cwd: baseCwd,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
+}
+
 function writeEnvFile({ routerRoot, instanceName, envPath, homePath, baseCwd, force }) {
   if (fs.existsSync(envPath) && !force) {
     console.log(`Keeping existing env: ${envPath}`);
@@ -109,7 +158,7 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
   const fileName = instanceName || 'default';
   const workdir = path.resolve(args.options.workdir || baseCwd);
   const allowedSenders = optionOrEnv('allowedSenders', 'FTB_ALLOWED_SENDERS', '');
-  const adminUsers = optionOrEnv('adminUsers', 'FTB_ADMIN_USERS', allowedSenders);
+  const adminUsers = optionOrEnv('adminUsers', 'FTB_ADMIN_USERS', '');
   const larkProfile = optionOrEnv('larkProfile', 'FTB_LARK_PROFILE', '');
   const larkAppId = optionOrEnv('botAppId', 'FTB_LARK_APP_ID', '');
   const values = {
@@ -119,7 +168,9 @@ function renderEnv({ instanceName, homePath, baseCwd }) {
     FTB_LARK_APP_ID: larkAppId,
     FTB_ALLOWED_SENDERS: allowedSenders,
     FTB_ALLOWED_CHATS: optionOrEnv('allowedChats', 'FTB_ALLOWED_CHATS', ''),
+    FTB_ALLOW_UNRESTRICTED: optionOrEnv('allowUnrestricted', 'FTB_ALLOW_UNRESTRICTED', 'false'),
     FTB_ADMIN_USERS: adminUsers,
+    FTB_ALLOW_ADMIN_ALL: optionOrEnv('allowAdminAll', 'FTB_ALLOW_ADMIN_ALL', 'false'),
     FTB_AUTO_CREATE_GROUP_SESSIONS: optionOrEnv('autoGroup', 'FTB_AUTO_CREATE_GROUP_SESSIONS', 'true'),
     FTB_AUTO_GROUP_SESSION_PREFIX: optionOrEnv('autoGroupPrefix', 'FTB_AUTO_GROUP_SESSION_PREFIX', 'group'),
     FTB_GROUP_REQUIRE_COMMAND: optionOrEnv('groupRequireCommand', 'FTB_GROUP_REQUIRE_COMMAND', 'true'),
@@ -230,6 +281,30 @@ function requireEnvHasExplicitBotInfo(envPath) {
   }
 }
 
+function requireEnvHasAccessPolicy(envPath) {
+  if (!fs.existsSync(envPath)) return;
+  const env = readDotEnv(envPath);
+  const hasAllowlist = csv(env.FTB_ALLOWED_SENDERS).length > 0 || csv(env.FTB_ALLOWED_CHATS).length > 0;
+  const unrestricted = truthy(env.FTB_ALLOW_UNRESTRICTED);
+  if (!hasAllowlist && !unrestricted) {
+    throw new Error([
+      `Env file lacks an access allowlist: ${envPath}`,
+      'Set FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS before starting the bridge.',
+      'Use FTB_ALLOW_UNRESTRICTED=true only for an intentionally public bridge.',
+    ].join(' '));
+  }
+
+  const hasAdmins = csv(env.FTB_ADMIN_USERS).length > 0;
+  const adminAll = truthy(env.FTB_ALLOW_ADMIN_ALL);
+  if (!hasAdmins && !adminAll) {
+    throw new Error([
+      `Env file lacks admin policy: ${envPath}`,
+      'Set FTB_ADMIN_USERS before starting the bridge.',
+      'Use FTB_ALLOW_ADMIN_ALL=true only when every allowed sender should be an admin.',
+    ].join(' '));
+  }
+}
+
 function maybeCreateLarkProfile() {
   if (!args.options.createLarkProfile) return;
   const profile = optionOrEnv('larkProfile', 'FTB_LARK_PROFILE', '');
@@ -276,6 +351,14 @@ function readDotEnv(file) {
     result[key] = value.replace(/\\"/g, '"');
   }
   return result;
+}
+
+function csv(value) {
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function truthy(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
 
 function dotenvValue(value) {
@@ -372,7 +455,9 @@ function optionKey(raw) {
     'bot-app-secret-env': 'botAppSecretEnv',
     'allowed-senders': 'allowedSenders',
     'allowed-chats': 'allowedChats',
+    'allow-unrestricted': 'allowUnrestricted',
     'admin-users': 'adminUsers',
+    'allow-admin-all': 'allowAdminAll',
     'auto-group': 'autoGroup',
     'auto-group-prefix': 'autoGroupPrefix',
     'group-require-command': 'groupRequireCommand',
@@ -473,7 +558,9 @@ Core options:
   --bot-app-secret-env NAME   Read app secret from an environment variable
   --allowed-senders IDS       Comma-separated Feishu user IDs
   --allowed-chats IDS         Comma-separated Feishu chat IDs
+  --allow-unrestricted BOOL   Explicitly allow an unrestricted public bridge
   --admin-users IDS           Comma-separated admin user IDs
+  --allow-admin-all BOOL      Treat every allowed sender as admin
   --workdir DIR               Default agent working directory
   --agent-cmd CMD             tmux fallback command
   --codex-listen URL          Codex app-server transport: stdio:// or unix://PATH
@@ -482,6 +569,11 @@ Core options:
   --set FTB_KEY=VALUE         Override a generated FTB_* value
   --force                     Rewrite existing env on init
   --dry-run                   Print farctl invocation without running it
+
+Instance registry:
+  init records --name -> env/home under ~/.feishu-agent-router/instances.json.
+  Later commands with the same --name reuse that env/home from any directory
+  unless --env or --home is passed explicitly.
 
 Examples:
   bridge-instance.mjs init --name sales --lark-profile sales-bot --bot-app-id cli_xxx --allowed-senders ou_xxx --admin-users ou_xxx

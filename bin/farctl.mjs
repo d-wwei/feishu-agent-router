@@ -23,6 +23,13 @@ const FTB_HOME = cli.options.home
     'FTB_HOME',
     INSTANCE_NAME ? path.join(HOME, `.feishu-agent-router-${INSTANCE_NAME}`) : path.join(HOME, '.feishu-agent-router'),
   );
+process.env.FTB_ENV_PATH = ENV_PATH;
+process.env.FTB_HOME = FTB_HOME;
+if (INSTANCE_NAME) {
+  process.env.FTB_INSTANCE_NAME = INSTANCE_NAME;
+} else {
+  delete process.env.FTB_INSTANCE_NAME;
+}
 const LOG_DIR = path.join(FTB_HOME, 'logs');
 const NODE = process.execPath;
 const UID = process.getuid?.() ?? Number(run('id', ['-u']).trim());
@@ -85,9 +92,9 @@ function install() {
   if (!fs.existsSync(ENV_PATH)) {
     throw new Error(`Missing ${ENV_PATH}. Create it from .env.example first.`);
   }
+  requireAccessPolicyForService();
   fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
-  fs.writeFileSync(PLIST_PATH, renderPlist());
-  console.log(`Installed ${PLIST_PATH}`);
+  writePlist();
   bootstrap();
   console.log('Service installed and started.');
   status();
@@ -104,10 +111,8 @@ function uninstall() {
 }
 
 function start() {
-  if (!fs.existsSync(PLIST_PATH)) {
-    fs.writeFileSync(PLIST_PATH, renderPlist());
-    console.log(`Installed ${PLIST_PATH}`);
-  }
+  requireAccessPolicyForService();
+  writePlist();
   bootstrap();
   status();
 }
@@ -118,7 +123,8 @@ function stop() {
 }
 
 function restart() {
-  bootout({ ignoreMissing: true });
+  requireAccessPolicyForService();
+  writePlist();
   bootstrap();
   status();
 }
@@ -181,11 +187,19 @@ async function allowlistCapture(args) {
     '--as',
     larkAs,
     '--jq',
-    '{message_id,chat_id,chat_type,sender_id,content}',
+    '{message_id,chat_id,chat_type,sender_id}',
     '--timeout',
     timeout,
     '--quiet',
   ], { profile: larkProfile });
+
+  if (!dryRun && isServiceLoaded()) {
+    throw new Error([
+      `Service ${LABEL} is running; stop it before allowlist-capture to avoid competing for the Feishu event stream.`,
+      `Run: farctl${INSTANCE_NAME ? ` --name ${INSTANCE_NAME}` : ''} --env "${ENV_PATH}" --home "${FTB_HOME}" stop`,
+      'Restart the service after the capture finishes.',
+    ].join(' '));
+  }
 
   console.log(`Capturing full Feishu sender_id/chat_id for ${LABEL}`);
   console.log(`profile: ${larkProfile}`);
@@ -215,10 +229,45 @@ async function allowlistCapture(args) {
   }
 }
 
+function requireAccessPolicyForService() {
+  const currentEnv = readDotEnv(ENV_PATH);
+  const hasAllowlist = csv(currentEnv.FTB_ALLOWED_SENDERS).length > 0 || csv(currentEnv.FTB_ALLOWED_CHATS).length > 0;
+  if (!hasAllowlist && !truthy(currentEnv.FTB_ALLOW_UNRESTRICTED)) {
+    throw new Error([
+      `Env file lacks an access allowlist: ${ENV_PATH}`,
+      'Set FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS before starting the bridge.',
+      'Use FTB_ALLOW_UNRESTRICTED=true only for an intentionally public bridge.',
+    ].join(' '));
+  }
+  const hasAdmins = csv(currentEnv.FTB_ADMIN_USERS).length > 0;
+  if (!hasAdmins && !truthy(currentEnv.FTB_ALLOW_ADMIN_ALL)) {
+    throw new Error([
+      `Env file lacks admin policy: ${ENV_PATH}`,
+      'Set FTB_ADMIN_USERS before starting the bridge.',
+      'Use FTB_ALLOW_ADMIN_ALL=true only when every allowed sender should be an admin.',
+    ].join(' '));
+  }
+}
+
 function passthroughDoctor() {
-  const result = spawnSync(NODE, [path.join(ROOT, 'bin', 'doctor.mjs')], {
+  const doctorArgs = [
+    path.join(ROOT, 'bin', 'doctor.mjs'),
+    '--env',
+    ENV_PATH,
+    '--home',
+    FTB_HOME,
+  ];
+  if (INSTANCE_NAME) doctorArgs.push('--name', INSTANCE_NAME);
+  doctorArgs.push(...rest);
+  const result = spawnSync(NODE, doctorArgs, {
     cwd: ROOT,
     stdio: 'inherit',
+    env: {
+      ...process.env,
+      FTB_ENV_PATH: ENV_PATH,
+      FTB_HOME,
+      ...(INSTANCE_NAME ? { FTB_INSTANCE_NAME: INSTANCE_NAME } : {}),
+    },
   });
   process.exitCode = result.status || 0;
 }
@@ -248,6 +297,55 @@ function readJson(file, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function readDotEnv(file) {
+  const result = {};
+  if (!fs.existsSync(file)) return result;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value.replace(/\\"/g, '"');
+  }
+  return result;
+}
+
+function csv(value) {
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function truthy(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function writePlist() {
+  fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
+  const next = renderPlist();
+  if (!fs.existsSync(PLIST_PATH)) {
+    fs.writeFileSync(PLIST_PATH, next);
+    console.log(`Installed ${PLIST_PATH}`);
+    return;
+  }
+  const current = fs.readFileSync(PLIST_PATH, 'utf8');
+  if (current !== next) {
+    fs.writeFileSync(PLIST_PATH, next);
+    console.log(`Updated ${PLIST_PATH} for env/home arguments`);
+  }
+}
+
+function isServiceLoaded() {
+  const result = spawnSync('launchctl', ['print', domainTarget()], { encoding: 'utf8' });
+  return result.status === 0;
 }
 
 function bootstrap() {
@@ -420,5 +518,9 @@ Examples:
   farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales install
   farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales allowlist-capture --timeout 120s
   farctl --name ops status
+
+Notes:
+  start/restart rewrite the launchd plist when --env or --home changes.
+  allowlist-capture refuses while this service is loaded; stop it first to avoid competing for Feishu events.
 `);
 }

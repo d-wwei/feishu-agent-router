@@ -18,6 +18,27 @@ test('evaluateAllowlist reports sender mismatch with remediation', () => {
   assert.match(result.remediation.join('\n'), /open_id is app-scoped/);
 });
 
+test('evaluateAllowlist fails closed when no allowlist is configured', () => {
+  const result = evaluateAllowlist(
+    { sender_id: 'ou_any', chat_id: 'oc_any' },
+    { allowedSenders: [], allowedChats: [] },
+  );
+
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, 'missing FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS');
+  assert.equal(result.field, 'allowlist');
+  assert.match(result.remediation.join('\n'), /FTB_ALLOW_UNRESTRICTED=true/);
+});
+
+test('evaluateAllowlist can be explicitly unrestricted', () => {
+  const result = evaluateAllowlist(
+    { sender_id: 'ou_any', chat_id: 'oc_any' },
+    { allowedSenders: [], allowedChats: [], allowUnrestricted: true },
+  );
+
+  assert.equal(result.allowed, true);
+});
+
 test('evaluateAllowlist reports chat mismatch after sender matches', () => {
   const result = evaluateAllowlist(
     { sender_id: 'ou_ok', chat_id: 'oc_new' },

@@ -55,13 +55,20 @@ farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales \
 
 `allowlist-capture` prints full `sender_id` and `chat_id` only to local stdout;
 the router log keeps policy blocks scoped to redacted IDs and remediation text.
+The router fails closed when both `FTB_ALLOWED_SENDERS` and `FTB_ALLOWED_CHATS`
+are empty. Set `FTB_ALLOW_UNRESTRICTED=true` only for an intentionally public
+bridge. Admin commands require `FTB_ADMIN_USERS`; set `FTB_ALLOW_ADMIN_ALL=true`
+only when every allowed sender should be treated as an admin.
+Because it consumes the same Feishu event stream as the router, `farctl
+allowlist-capture` refuses while the matching launchd service is loaded. Stop
+that instance first, capture the IDs, then start it again.
 If you run raw `lark-cli event consume` from an agent subprocess, keep stdin open
 or it may exit on EOF:
 
 ```bash
 lark-cli --profile sales-bot event consume im.message.receive_v1 \
   --as bot \
-  --jq '{message_id,chat_id,chat_type,sender_id,content}' \
+  --jq '{message_id,chat_id,chat_type,sender_id}' \
   --timeout 120s \
   < <(tail -f /dev/null)
 ```
@@ -94,6 +101,10 @@ This is the lightweight completion signal used by operators and monitors:
 `active_turn: none` means the router is not currently processing an inbound
 message in that instance.
 
+`farctl start` and `farctl restart` rewrite the matching launchd plist whenever
+the passed `--env` or `--home` changes, so the plist cannot silently keep an
+older env/home while the CLI reports a newer one.
+
 Multiple bot instances can run side-by-side by giving each one its own
 Feishu app/profile, instance name, env file, and runtime home:
 
@@ -111,6 +122,11 @@ The default instance keeps the legacy service label `com.feishu-agent-router`.
 Named instances use labels such as `com.feishu-agent-router.sales`, so installing
 one will not overwrite another. Instance names do not create new Feishu bots by
 themselves; `FTB_LARK_PROFILE` and `FTB_LARK_APP_ID` select the bot identity.
+
+The `skills/feishu-bridge/scripts/bridge-instance.mjs` helper records successful
+`init` paths in `~/.feishu-agent-router/instances.json`. After `init`, later
+helper commands with the same `--name` reuse the registered env/home from any
+working directory unless `--env` or `--home` is passed explicitly.
 
 The launchd plist is installed to:
 
@@ -170,6 +186,10 @@ a new group automatically creates a dedicated session and binds that group to
 it. Manual `/new` and `/bind` are still available when you want explicit names
 or non-default backend settings.
 
+`/new --agent script` is for explicit shell commands only and requires
+`--cmd <command>`; without it the router rejects the command instead of
+starting a session whose command is just the word `script`.
+
 ## Commands
 
 ```text
@@ -184,10 +204,11 @@ or non-default backend settings.
 /capture [session]
 /status [session]
 /interrupt [session]
-/new <name> [--agent codex|claude|gemini|script] [--cwd path] [--cmd command]
+/new <name> [--agent codex|claude|gemini] [--cwd path] [--cmd command]
+/new <name> --agent script --cmd <command>
 /stop [session]
 /restart [session]
-/file [session] [note]
+/file --message-id <message_id> [session] [note]
 ```
 
 Admin-only commands:
@@ -199,6 +220,11 @@ Admin-only commands:
 /stop
 /restart
 ```
+
+`/interrupt` and `/status` bypass the normal per-turn delivery queue so they
+can still respond while a long Codex turn is running. `/stop` marks a
+`codex-app-server` session as manually stopped; ordinary messages and `/send`
+are rejected until `/restart` clears the stop marker and starts a fresh thread.
 
 ## Session Examples
 
@@ -259,9 +285,16 @@ Phase 2: office materials
 - Inbound text/post/image/file/video/merge-forward messages are normalized
 - Merge-forward messages are expanded by fetching child messages through
   `GET /open-apis/im/v1/messages/{message_id}` before they are sent to Codex
-- Non-text and `/file` messages are saved under `inbox/`
+- Image/file/video events that arrive without a downloadable key are hydrated
+  through `GET /open-apis/im/v1/messages/{message_id}` so `body.content` can be
+  parsed before resource download plans are created
+- Non-text messages and explicit `/file --message-id <message_id>` captures are
+  saved under `inbox/`
 - `message.json`, `content.md`, and `manifest.json` are created
-- The router tries Feishu official resource download for image/file/video attachments
+- Inbox directories are written with `0700` permissions and inbox files with
+  `0600` permissions
+- The router tries Feishu official resource download for image/file/video
+  attachments only when a concrete file key is available
 - Local inbox paths are passed to the backend session
 - Merge-forward parsing requires the bot/profile to have message-read access to
   the source chat; common missing scopes are `im:message.group_msg` and
@@ -280,7 +313,6 @@ Feishu UX migration:
 
 - Replies use Feishu post messages for normal markdown and interactive cards for code blocks/tables
 - Message reactions are added as best-effort phase feedback when the bot has reaction permission
-- Permission cards can be rendered, but button callback handling is not wired until the active `lark-cli` event catalog exposes card action events; text fallback commands remain the safe path
 - Streaming replies default to `FTB_FEISHU_STREAMING=auto`: short replies are sent once as final messages, while likely long/complex tasks start a streaming card after `FTB_FEISHU_STREAM_START_DELAY_MS`; set it to `always` or `off` to override. Live progress cards preserve the running transcript but insert a `实时进展` heading and paragraph breaks so long Codex status streams are readable in Feishu.
 - When Codex is still cold or prewarming, Router sends one updatable card after `FTB_COLD_START_CARD_DELAY_MS` and patches that same card with the final answer.
 - Router owns replies to the current inbound message. Codex should return final
@@ -356,4 +388,6 @@ fallback from `codex-app-server` to tmux is disabled by default because a broken
 terminal Codex environment can leak TUI chrome back to Feishu and create extra
 local Codex sessions. Set `FTB_ENABLE_TMUX_FALLBACK=true` only for deployments
 where the tmux command is known to inherit the required model/provider
-environment and terminal output parsing is acceptable.
+environment and terminal output parsing is acceptable. Codex turn timeout and
+interrupt failures never fall back to tmux; they stay on the app-server path and
+return the timeout/interrupt message to Feishu.

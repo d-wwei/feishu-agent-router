@@ -27,7 +27,7 @@ printf '%s' "$FEISHU_APP_SECRET" | lark-cli profile add --name <profile> --app-i
 
 ## Commands
 
-Run all commands from any working directory. By default the helper stores per-directory env files under `.feishu-bridge/<instance>.env` and runtime data under `~/.feishu-agent-router-<instance>`.
+Run all commands from any working directory. On `init`, the helper stores the env file under `.feishu-bridge/<instance>.env` in the current directory, records `--name -> env/home` in `~/.feishu-agent-router/instances.json`, and stores runtime data under `~/.feishu-agent-router-<instance>` by default. Later commands with the same `--name` reuse the registered env/home from any working directory unless `--env` or `--home` is passed explicitly.
 
 ```bash
 node "$SKILL_DIR/scripts/bridge-instance.mjs" init --name sales --lark-profile sales-bot --bot-app-id cli_xxx
@@ -57,7 +57,9 @@ Important options:
 - `--bot-app-secret-env <name>`: read the app secret from an environment variable when creating the profile.
 - `--allowed-senders <ids>`: comma-separated Feishu user IDs allowed to talk to the bridge.
 - `--allowed-chats <ids>`: comma-separated Feishu chat IDs allowed to talk to the bridge.
+- `--allow-unrestricted true`: explicitly allow a public bridge without sender/chat allowlists.
 - `--admin-users <ids>`: comma-separated Feishu user IDs allowed to run admin commands.
+- `--allow-admin-all true`: explicitly allow every allowed sender to run admin commands.
 - `--lark-as <bot|user>`: identity passed to `lark-cli`.
 - `--workdir <dir>`: default Codex working directory for new sessions.
 - `--agent-cmd <cmd>`: tmux fallback command.
@@ -78,6 +80,9 @@ node "$SKILL_DIR/scripts/bridge-instance.mjs" allowlist-capture --name <instance
 ```
 
 Then send one message to the bot and copy the printed full `sender_id` into `FTB_ALLOWED_SENDERS` and `FTB_ADMIN_USERS`.
+If the launchd service for that instance is running, `allowlist-capture` refuses
+so it cannot compete with the router for the same Feishu event stream. Stop the
+instance first, capture the IDs, then start it again.
 
 ## Workflow
 
@@ -85,10 +90,10 @@ Then send one message to the bot and copy the printed full `sender_id` into `FTB
 2. Run `init` with `--lark-profile`, `--bot-app-id`, and explicit allowlists. If allowlists are unknown, create the env file with placeholders and tell the user which `FTB_ALLOWED_*` values must be filled before install.
 3. For lifecycle actions, run the matching helper command. `install`, `start`, and `restart` create the env file only when explicit bot info was provided.
 4. For "bot online but not replying", prefer `doctor`, then `logs 200`. If logs show `ignored event by policy`, run `allowlist-capture --timeout 120s` and update `FTB_ALLOWED_SENDERS` because open_id changes across bot apps.
-5. For multiple bots, always use distinct `--lark-profile`, `--bot-app-id`, `--name`, `--env`, and `--home` values. The helper's defaults already isolate named env/home paths.
+5. For multiple bots, always use distinct `--lark-profile`, `--bot-app-id`, `--name`, `--env`, and `--home` values. The helper's defaults already isolate named env/home paths and remember them after `init`.
 
 ## Safety
 
-Do not edit launchd plists by hand. Do not start the router with missing allowlists unless the user explicitly accepts that configuration. Do not run two router instances for the same `--bot-app-id`; the router has a global lock and will reject duplicates. Prefer `uninstall` over deleting plist files manually; it keeps runtime data in place for inspection.
+Do not edit launchd plists by hand. Do not start the router with missing allowlists unless the user explicitly sets `--allow-unrestricted true`; do not leave admin policy empty unless the user explicitly sets `--allow-admin-all true`. Do not run two router instances for the same `--bot-app-id`; the router has a global lock and will reject duplicates. Prefer `uninstall` over deleting plist files manually; it keeps runtime data in place for inspection.
 
-When using raw `lark-cli event consume` from an agent subprocess, keep stdin open with `< <(tail -f /dev/null)`. The helper's `allowlist-capture` command already does this.
+When using raw `lark-cli event consume` from an agent subprocess, keep stdin open with `< <(tail -f /dev/null)`. The helper's `allowlist-capture` command already does this, and refuses while the matching service is loaded to avoid racing the router's event consumer.

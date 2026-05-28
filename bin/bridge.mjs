@@ -9,6 +9,8 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import {
   createInboxEntryLike,
+  fetchMessageWithLarkCli,
+  hydrateAttachmentEvent,
   hydrateMergeForwardEvent,
   normalizeInboundEvent,
 } from '../lib/feishu-ingest.mjs';
@@ -47,6 +49,9 @@ import {
 import {
   shouldUseTmuxFallback,
   isCodexFirstOutputTimeout,
+  isManuallyStoppedSession,
+  shouldBypassGlobalQueue,
+  stoppedSessionError,
   userFacingSessionError,
 } from '../lib/bridge-fallback.mjs';
 import {
@@ -80,7 +85,7 @@ const AUDIT_PATH = path.join(LOG_DIR, 'audit.jsonl');
 const LOG_PATH = path.join(LOG_DIR, 'router.log');
 
 for (const dir of [DATA_DIR, LOG_DIR, INBOX_DIR]) {
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
 }
 
 const cfg = {
@@ -89,7 +94,9 @@ const cfg = {
   larkAppId: env('FTB_LARK_APP_ID', ''),
   allowedSenders: csvEnv('FTB_ALLOWED_SENDERS'),
   allowedChats: csvEnv('FTB_ALLOWED_CHATS'),
-  adminUsers: csvEnv('FTB_ADMIN_USERS', env('FTB_ALLOWED_SENDERS', '')),
+  allowUnrestricted: boolEnv('FTB_ALLOW_UNRESTRICTED', false),
+  adminUsers: csvEnv('FTB_ADMIN_USERS'),
+  allowAdminAll: boolEnv('FTB_ALLOW_ADMIN_ALL', false),
   defaultSession: env('FTB_DEFAULT_SESSION', 'main'),
   defaultBackend: env('FTB_DEFAULT_BACKEND', 'codex-app-server'),
   defaultWorkdir: env('FTB_WORKDIR', process.env.HOME || '/tmp'),
@@ -271,12 +278,13 @@ function readJson(file, fallback) {
 }
 
 function writeJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(value, null, 2));
+  writePrivateFile(file, JSON.stringify(value, null, 2));
 }
 
 function appendJsonl(file, value) {
-  fs.appendFileSync(file, `${JSON.stringify({ ts: now(), ...value })}\n`);
+  ensurePrivateDir(path.dirname(file));
+  fs.appendFileSync(file, `${JSON.stringify({ ts: now(), ...value })}\n`, { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
 }
 
 function now() {
@@ -286,7 +294,24 @@ function now() {
 function log(message, extra) {
   const line = `[${now()}] ${message}${extra ? ` ${JSON.stringify(extra)}` : ''}`;
   console.log(line);
-  fs.appendFileSync(LOG_PATH, `${line}\n`);
+  appendPrivateLog(LOG_PATH, `${line}\n`);
+}
+
+function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(dir, 0o700); } catch {}
+}
+
+function writePrivateFile(file, content) {
+  ensurePrivateDir(path.dirname(file));
+  fs.writeFileSync(file, content, { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+
+function appendPrivateLog(file, content) {
+  ensurePrivateDir(path.dirname(file));
+  fs.appendFileSync(file, content, { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
 }
 
 function logCodexAppServerStderr(chunk) {
@@ -429,6 +454,10 @@ function startEventConsumer() {
         event = JSON.parse(line);
       } catch (error) {
         log(`skipping non-json event line`, { line, error: String(error) });
+        return;
+      }
+      if (shouldBypassEventQueue(event)) {
+        handleEvent(event).catch((error) => log(`event handling failed`, { error: stackOf(error), bypassedQueue: true }));
         return;
       }
       queue = queue
@@ -574,6 +603,25 @@ async function handleEvent(event) {
     return;
   }
 
+  const attachmentHydrated = hydrateAttachmentEvent(event, {
+    normalized,
+    as: cfg.larkAs,
+    profile: cfg.larkProfile,
+    cwd: ROOT,
+  });
+  if (attachmentHydrated.fetchResult) {
+    log('attachment content fetch completed', {
+      messageId,
+      status: attachmentHydrated.fetchResult.status,
+      ok: attachmentHydrated.fetchResult.ok,
+      hasMessage: Boolean(attachmentHydrated.fetchResult.message),
+      error: attachmentHydrated.fetchResult.error || '',
+      failure: attachmentHydrated.fetchResult.failureSummary || '',
+    });
+  }
+  event = attachmentHydrated.event;
+  normalized = attachmentHydrated.normalized;
+
   let content = normalized.text || String(event.content || '').trim();
   if (!content) {
     await reply(messageId, '收到空消息，已忽略。');
@@ -620,12 +668,18 @@ async function handleEvent(event) {
 }
 
 function isAdmin(event) {
-  if (!cfg.adminUsers.length) return true;
+  if (cfg.allowAdminAll) return true;
+  if (!cfg.adminUsers.length) return false;
   return cfg.adminUsers.includes(event.sender_id);
 }
 
 function isCommand(content) {
   return content.startsWith('/');
+}
+
+function shouldBypassEventQueue(event) {
+  const normalized = normalizeInboundEvent(event);
+  return shouldBypassGlobalQueue(normalized.text);
 }
 
 function recordInboundMessage(event, normalized, content) {
@@ -814,11 +868,14 @@ async function cmdInterrupt(event, tokens) {
 
 async function cmdNew(event, tokens) {
   const name = tokens.shift();
-  if (!name) throw new Error('用法：/new <name> [--backend codex-app-server|tmux] [--agent codex] [--cwd path] [--cmd command]');
+  if (!name) throw new Error('用法：/new <name> [--backend codex-app-server|tmux] [--agent codex|claude|gemini] [--cwd path] [--cmd command]');
   if (state.sessions[name]) throw new Error(`session 已存在：${name}`);
 
   const opts = parseOptions(tokens);
   const agent = opts.agent || 'codex';
+  if (agent === 'script' && !opts.cmd) {
+    throw new Error('用法：/new <name> --agent script --cmd <command>');
+  }
   const backend = opts.backend || (agent === 'codex' ? cfg.defaultBackend : 'tmux');
   const cwd = opts.cwd || cfg.defaultWorkdir;
   const command = opts.cmd || defaultCommandForAgent(agent, cwd);
@@ -853,9 +910,47 @@ async function cmdRestart(event, tokens) {
 }
 
 async function cmdFile(event, tokens) {
-  const { sessionName, rest } = splitSessionArg(event, tokens);
+  const fileArgs = parseFileCommandArgs(tokens);
+  if (!fileArgs.messageId) {
+    throw new Error('用法：/file --message-id <message_id> [session] [note]。/file 不能处理当前命令消息，请显式提供要保存的消息 ID。');
+  }
+  const { sessionName, rest } = splitSessionArg(event, fileArgs.rest);
   const note = rest.join(' ').trim();
-  const inbox = createInboxEntry(event);
+  const fetched = fetchMessageWithLarkCli(fileArgs.messageId, {
+    as: cfg.larkAs,
+    profile: cfg.larkProfile,
+    cwd: ROOT,
+  });
+  if (!fetched.ok || !fetched.message) {
+    throw new Error(`无法读取消息 ${fileArgs.messageId}：${fetched.failureSummary || 'message get failed'}`);
+  }
+  let targetEvent = {
+    ...fetched.message,
+    message_id: fetched.message.message_id || fileArgs.messageId,
+    chat_id: fetched.message.chat_id || event.chat_id,
+    chat_type: fetched.message.chat_type || event.chat_type,
+    sender_id: fetched.message.sender_id || event.sender_id,
+    thread_id: fetched.message.thread_id || event.thread_id,
+  };
+  let normalized = normalizeInboundEvent(targetEvent);
+  const attachmentHydrated = hydrateAttachmentEvent(targetEvent, {
+    normalized,
+    as: cfg.larkAs,
+    profile: cfg.larkProfile,
+    cwd: ROOT,
+  });
+  targetEvent = attachmentHydrated.event;
+  normalized = attachmentHydrated.normalized;
+  const mergeHydrated = hydrateMergeForwardEvent(targetEvent, {
+    normalized,
+    as: cfg.larkAs,
+    profile: cfg.larkProfile,
+    cwd: ROOT,
+  });
+  targetEvent = mergeHydrated.event;
+  normalized = mergeHydrated.normalized;
+
+  const inbox = createInboxEntry(targetEvent, normalized);
   const prompt = [
     '飞书消息材料已保存到本地 inbox。',
     `目录：${inbox.dir}`,
@@ -863,6 +958,22 @@ async function cmdFile(event, tokens) {
     '请读取该目录下的 content.md、message.json、manifest.json 和 attachments/ 后处理。',
   ].filter(Boolean).join('\n');
   await sendToSession(event, sessionName, prompt, { saveInbox: false });
+}
+
+function parseFileCommandArgs(tokens) {
+  const rest = [];
+  let messageId = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token === '--message-id' || token === '--message_id' || token === '-m') {
+      messageId = tokens[++i] || null;
+    } else if (token.startsWith('--message-id=')) {
+      messageId = token.slice('--message-id='.length) || null;
+    } else {
+      rest.push(token);
+    }
+  }
+  return { messageId, rest };
 }
 
 function splitSessionArg(event, tokens) {
@@ -882,8 +993,10 @@ async function sendToSession(event, sessionName, content, opts = {}) {
   const timing = createTurnTiming();
   let backendName = session.backend;
   let stream = null;
-  const activeTurnId = startActiveTurn(event, sessionName, content, opts.normalized);
+  let activeTurnId = null;
   try {
+    if (isManuallyStoppedSession(session)) throw stoppedSessionError(sessionName);
+    activeTurnId = startActiveTurn(event, sessionName, content, opts.normalized);
     const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
     const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
     await maybeReactPhase1(event, content);
@@ -932,7 +1045,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
       error: error.message || String(error),
     });
   } finally {
-    clearActiveTurn(activeTurnId);
+    if (activeTurnId) clearActiveTurn(activeTurnId);
   }
 }
 
@@ -1027,7 +1140,7 @@ async function runSessionWithFallback(sessionName, backend, prompt, opts = {}) {
     return await backend.run(sessionName, prompt, opts);
   } catch (error) {
     const session = getSession(sessionName);
-    if (!shouldUseTmuxFallback(session, cfg)) throw error;
+    if (!shouldUseTmuxFallback(session, cfg, error)) throw error;
     log('codex app-server failed; falling back to tmux', { sessionName, error: error.message || String(error) });
     updateSessionFields(sessionName, { threadId: null, state: 'stopped', updatedAt: now() });
     const result = await tmuxBackend.run(sessionName, prompt, opts);
@@ -1559,18 +1672,26 @@ const codexAppServerBackend = {
       `effort: ${cfg.codexReasoningEffort || '(default)'}`,
       `sandbox: ${cfg.codexSandbox}`,
       `approval: ${cfg.codexApprovalPolicy}`,
+      `state: ${session.state || '-'}`,
+      session.stopReason ? `stop reason: ${session.stopReason}` : '',
       `fallback tmux: ${session.tmuxSession || cfg.defaultTmuxSession}`,
       `updated: ${session.updatedAt || '-'}`,
-    ].join('\n');
+    ].filter((line) => line !== '').join('\n');
   },
   async interrupt(name) {
     codexAppServer.interruptThread(getSession(name).threadId);
   },
   async stop(name) {
-    updateSessionFields(name, { state: 'stopped', updatedAt: now() });
+    updateSessionFields(name, { state: 'stopped', stopReason: 'manual', stoppedAt: now(), updatedAt: now() });
   },
   async restart(name) {
-    updateSessionFields(name, { threadId: null, state: 'stopped', updatedAt: now() });
+    updateSessionFields(name, {
+      threadId: null,
+      state: 'stopped',
+      stopReason: undefined,
+      stoppedAt: undefined,
+      updatedAt: now(),
+    });
     await this.ensure(name);
   },
 };
@@ -1868,6 +1989,10 @@ const tmuxBackend = {
 function updateSessionState(name, value) {
   state.sessions[name].state = value;
   state.sessions[name].updatedAt = now();
+  if (value === 'running') {
+    delete state.sessions[name].stopReason;
+    delete state.sessions[name].stoppedAt;
+  }
   writeJson(SESSIONS_PATH, state.sessions);
 }
 
@@ -1876,6 +2001,16 @@ function updateSessionFields(name, fields) {
     ...state.sessions[name],
     ...fields,
   };
+  if (fields.state === 'running') {
+    delete state.sessions[name].stopReason;
+    delete state.sessions[name].stoppedAt;
+  }
+  if (Object.hasOwn(fields, 'stopReason') && fields.stopReason === undefined) {
+    delete state.sessions[name].stopReason;
+  }
+  if (Object.hasOwn(fields, 'stoppedAt') && fields.stoppedAt === undefined) {
+    delete state.sessions[name].stoppedAt;
+  }
   writeJson(SESSIONS_PATH, state.sessions);
 }
 
@@ -1903,47 +2038,13 @@ function hasTmuxSession(tmuxSession) {
 }
 
 function createInboxEntry(event, normalized) {
-  const entry = createInboxEntryLike(event, {
+  return createInboxEntryLike(event, {
     inboxRoot: INBOX_DIR,
     larkAs: cfg.larkAs,
     larkProfile: cfg.larkProfile,
     normalized,
     download: true,
   });
-  const effective = normalized || entry.normalized;
-  const manifest = {
-    ...entry.manifest,
-    attachments: entry.manifest.downloads || [],
-    genericDownloadFallbacks: [],
-  };
-
-  if (needsGenericDownloadFallback(effective, manifest)) {
-    for (const type of genericResourceTypes(effective.messageType)) {
-      const result = spawnSync(
-        'lark-cli',
-        larkCliArgs(['im', '+messages-resources-download', '--as', cfg.larkAs, '--message-id', effective.messageId, '--type', type]),
-        { cwd: entry.attachmentsDir, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-      );
-      const record = { type, stdout: result.stdout.trim(), stderr: result.stderr.trim(), status: result.status };
-      if (result.status === 0) manifest.genericDownloadFallbacks.push(record);
-      else manifest.downloadErrors.push(record);
-    }
-  }
-
-  writeJson(path.join(entry.dir, 'manifest.json'), manifest);
-  return { ...entry, manifest };
-}
-
-function needsGenericDownloadFallback(normalized, manifest) {
-  if (!normalized?.messageId) return false;
-  if (!['image', 'file', 'video'].includes(normalized.messageType)) return false;
-  return (manifest.downloads?.length || 0) === 0 && (manifest.genericDownloadFallbacks?.length || 0) === 0;
-}
-
-function genericResourceTypes(messageType) {
-  if (messageType === 'image') return ['image'];
-  if (messageType === 'file' || messageType === 'video') return ['file'];
-  return [];
 }
 
 async function maybeReactPhase1(event, content) {
@@ -2222,10 +2323,11 @@ function helpText() {
     '/capture [session]',
     '/status [session]',
     '/interrupt [session]',
-    '/new <name> [--backend codex-app-server|tmux] [--agent codex|claude|gemini|script] [--cwd path] [--cmd command]',
+    '/new <name> [--backend codex-app-server|tmux] [--agent codex|claude|gemini] [--cwd path] [--cmd command]',
+    '/new <name> --agent script --cmd <command>',
     '/stop [session]',
     '/restart [session]',
-    '/file [session] [note]',
+    '/file --message-id <message_id> [session] [note]',
   ].join('\n');
 }
 
