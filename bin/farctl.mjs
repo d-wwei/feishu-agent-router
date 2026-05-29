@@ -231,11 +231,11 @@ async function allowlistCapture(args) {
 
 function requireAccessPolicyForService() {
   const currentEnv = readDotEnv(ENV_PATH);
-  const hasAllowlist = csv(currentEnv.FTB_ALLOWED_SENDERS).length > 0 || csv(currentEnv.FTB_ALLOWED_CHATS).length > 0;
-  if (!hasAllowlist && !truthy(currentEnv.FTB_ALLOW_UNRESTRICTED)) {
+  const hasSenderAllowlist = csv(currentEnv.FTB_ALLOWED_SENDERS).length > 0;
+  if (!hasSenderAllowlist && !truthy(currentEnv.FTB_ALLOW_UNRESTRICTED)) {
     throw new Error([
       `Env file lacks an access allowlist: ${ENV_PATH}`,
-      'Set FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS before starting the bridge.',
+      'Set FTB_ALLOWED_SENDERS before starting the bridge. FTB_ALLOWED_CHATS is only an additional scope constraint.',
       'Use FTB_ALLOW_UNRESTRICTED=true only for an intentionally public bridge.',
     ].join(' '));
   }

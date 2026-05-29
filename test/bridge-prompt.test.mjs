@@ -28,6 +28,25 @@ test('per-turn Feishu prompt keeps only message metadata and user content', () =
   assert.doesNotMatch(prompt, /The router will send that text back to Feishu/);
 });
 
+test('per-turn Feishu prompt prefers normalized promptText projections', () => {
+  const prompt = buildPrompt(
+    {
+      sender_id: 'ou_sender',
+      chat_id: 'oc_chat',
+    },
+    '[business_card] cards=1 status=parsed textItems=1 actions=0 refs=0 entities=0',
+    'main',
+    '/tmp/inbox/om_card',
+    {
+      text: '[business_card] cards=1 status=parsed textItems=1 actions=0 refs=0 entities=0',
+      promptText: '业务卡片可见内容摘要',
+    },
+  );
+
+  assert.match(prompt, /\[User message\]\n业务卡片可见内容摘要/);
+  assert.doesNotMatch(prompt, /cards=1 status=parsed/);
+});
+
 test('Feishu bridge delivery rules live in developer instructions', () => {
   const instructions = bridgeDeveloperInstructions();
 

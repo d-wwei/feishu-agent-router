@@ -189,7 +189,7 @@ test('bridge-instance refuses to start without access and admin policies', () =>
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS/);
+  assert.match(result.stderr, /FTB_ALLOWED_SENDERS/);
 });
 
 test('bridge-instance refuses to start with allowlist but no admin policy', () => {

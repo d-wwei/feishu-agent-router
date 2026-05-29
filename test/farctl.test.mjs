@@ -146,7 +146,7 @@ test('farctl start refuses env without access policy', () => {
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /FTB_ALLOWED_SENDERS or FTB_ALLOWED_CHATS/);
+  assert.match(result.stderr, /FTB_ALLOWED_SENDERS/);
 });
 
 test('farctl start refuses env without admin policy', () => {

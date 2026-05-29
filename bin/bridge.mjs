@@ -138,6 +138,7 @@ const cfg = {
   codexHttpProviderId: env('FTB_CODEX_HTTP_PROVIDER_ID', 'chatgpt_http'),
   codexHttpProviderName: env('FTB_CODEX_HTTP_PROVIDER_NAME', 'ChatGPT HTTP'),
   codexHttpProviderBaseUrl: env('FTB_CODEX_HTTP_PROVIDER_BASE_URL', 'https://chatgpt.com/backend-api/codex'),
+  larkCliTimeoutMs: intEnv('FTB_LARK_CLI_TIMEOUT_MS', 30_000),
   enableTmuxFallback: boolEnv('FTB_ENABLE_TMUX_FALLBACK', false),
   prewarmCodex: boolEnv('FTB_PREWARM_CODEX', true),
   prewarmSessions: csvEnv('FTB_PREWARM_SESSIONS', env('FTB_DEFAULT_SESSION', 'main')),
@@ -149,10 +150,37 @@ const cfg = {
   feishuStreamStartDelayMs: intEnv('FTB_FEISHU_STREAM_START_DELAY_MS', 5_000),
   feishuStreamMinChars: intEnv('FTB_FEISHU_STREAM_MIN_CHARS', 240),
   feishuStreamPatchMs: intEnv('FTB_FEISHU_STREAM_PATCH_MS', 2_000),
+  audioDownload: boolEnv('FTB_AUDIO_DOWNLOAD', true),
+  audioTranscribe: env('FTB_AUDIO_TRANSCRIBE', 'local'),
+  audioTranscribeEngine: env('FTB_AUDIO_TRANSCRIBE_ENGINE', 'auto'),
+  audioTranscribeModel: env('FTB_AUDIO_TRANSCRIBE_MODEL', 'small'),
+  audioTranscribeMaxSeconds: intEnv('FTB_AUDIO_TRANSCRIBE_MAX_SECONDS', 120),
+  audioTranscribeMaxMb: intEnv('FTB_AUDIO_TRANSCRIBE_MAX_MB', 25),
+  audioTranscribeTimeoutMs: intEnv('FTB_AUDIO_TRANSCRIBE_TIMEOUT_MS', 120_000),
+  audioTranscribeLanguage: env('FTB_AUDIO_TRANSCRIBE_LANGUAGE', 'auto'),
+  audioTranscribeRequireLocal: boolEnv('FTB_AUDIO_TRANSCRIBE_REQUIRE_LOCAL', true),
+  audioTranscribeSendToCodex: boolEnv('FTB_AUDIO_TRANSCRIBE_SEND_TO_CODEX', true),
+  audioTranscriptInManifest: boolEnv('FTB_AUDIO_TRANSCRIPT_IN_MANIFEST', false),
+  audioTranscribeQueueMax: intEnv('FTB_AUDIO_TRANSCRIBE_QUEUE_MAX', 4),
+  audioTranscribeConcurrency: intEnv('FTB_AUDIO_TRANSCRIBE_CONCURRENCY', 1),
+  audioTranscribePerSenderPerHour: intEnv('FTB_AUDIO_TRANSCRIBE_PER_SENDER_PER_HOUR', 20),
+  mediaMaxDownloadMb: intEnv('FTB_MEDIA_MAX_DOWNLOAD_MB', 100),
+  mediaInboxMaxMb: intEnv('FTB_MEDIA_INBOX_MAX_MB', 2048),
+  whisperCppPath: env('FTB_WHISPER_CPP_PATH', 'whisper-cli'),
+  whisperCppModel: env('FTB_WHISPER_CPP_MODEL', ''),
+  mlxWhisperBin: env('FTB_MLX_WHISPER_BIN', 'python'),
+  fasterWhisperBin: env('FTB_FASTER_WHISPER_BIN', 'python'),
+  mlxWhisperModel: env('FTB_MLX_WHISPER_MODEL', ''),
+  fasterWhisperModel: env('FTB_FASTER_WHISPER_MODEL', ''),
+  audioTranscoder: env('FTB_AUDIO_TRANSCODER', 'auto'),
+  fakeAudioTranscribePath: env('FTB_FAKE_AUDIO_TRANSCRIBE_PATH', ''),
 };
 
 let state = loadState();
 let queue = Promise.resolve();
+const materialJobs = [];
+let activeMaterialJobs = 0;
+const materialRate = new Map();
 let shuttingDown = false;
 let prewarmState = {
   status: cfg.prewarmCodex ? 'pending' : 'disabled',
@@ -323,6 +351,16 @@ function logCodexAppServerStderr(chunk) {
   }
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function commandOutputSummary(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return `len=${text.length} sha256=${sha256(text).slice(0, 16)}`;
+}
+
 function run(cmd, args, opts = {}) {
   const result = spawnSync(cmd, args, {
     encoding: 'utf8',
@@ -398,6 +436,7 @@ function resolveRuntimeLarkBotIdentity() {
     encoding: 'utf8',
     cwd: ROOT,
     maxBuffer: 4 * 1024 * 1024,
+    timeout: cfg.larkCliTimeoutMs,
   });
   const profiles = result.status === 0 ? parseLarkProfileList(result.stdout) : [];
   return resolveLarkBotIdentity({ profiles, profile: cfg.larkProfile });
@@ -444,7 +483,7 @@ function startEventConsumer() {
   child.stdin.write('\n');
 
   readline.createInterface({ input: child.stderr, crlfDelay: Infinity })
-    .on('line', (line) => log(`[event stderr] ${line}`));
+    .on('line', (line) => log('[event stderr]', { stderr: commandOutputSummary(line) }));
 
   readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
     .on('line', (line) => {
@@ -453,7 +492,7 @@ function startEventConsumer() {
       try {
         event = JSON.parse(line);
       } catch (error) {
-        log(`skipping non-json event line`, { line, error: String(error) });
+        log(`skipping non-json event line`, { line: commandOutputSummary(line), error: String(error) });
         return;
       }
       if (shouldBypassEventQueue(event)) {
@@ -608,6 +647,7 @@ async function handleEvent(event) {
     as: cfg.larkAs,
     profile: cfg.larkProfile,
     cwd: ROOT,
+    timeoutMs: cfg.larkCliTimeoutMs,
   });
   if (attachmentHydrated.fetchResult) {
     log('attachment content fetch completed', {
@@ -644,6 +684,7 @@ async function handleEvent(event) {
     as: cfg.larkAs,
     profile: cfg.larkProfile,
     cwd: ROOT,
+    timeoutMs: cfg.larkCliTimeoutMs,
   });
   if (hydrated.fetchResult) {
     log('merge_forward fetch completed', {
@@ -658,6 +699,21 @@ async function handleEvent(event) {
   event = hydrated.event;
   normalized = hydrated.normalized;
   content = normalized.text || String(event.content || '').trim();
+
+  if (normalized.deliverToCodex === false) {
+    recordInboundMessage(event, normalized, content);
+    if (shouldSaveInbox(normalized)) createInboxEntry(event, normalized);
+    return;
+  }
+
+  if (shouldUseMaterialJob(normalized)) {
+    recordInboundMessage(event, normalized, content);
+    const queued = enqueueMaterialJob({ event, normalized, content, sessionName: resolveSessionName(event) });
+    if (!queued.ok) {
+      await reply(messageId, materialQueueRejectMessage(queued.reason));
+    }
+    return;
+  }
 
   recordInboundMessage(event, normalized, content);
 
@@ -699,6 +755,7 @@ function recordInboundMessage(event, normalized, content) {
 }
 
 function auditContentPreview(normalized, content) {
+  if (normalized?.logPreview) return String(normalized.logPreview).slice(0, 500);
   if (normalized?.messageType === 'merge_forward') {
     return mergeForwardContentPreview(normalized);
   }
@@ -706,6 +763,7 @@ function auditContentPreview(normalized, content) {
 }
 
 function logContentPreview(normalized, content) {
+  if (normalized?.logPreview) return String(normalized.logPreview).slice(0, 80);
   if (normalized?.messageType === 'merge_forward') {
     return mergeForwardContentPreview(normalized);
   }
@@ -730,6 +788,113 @@ function shouldSaveInbox(normalized) {
   return false;
 }
 
+function shouldUseMaterialJob(normalized) {
+  if (!normalized) return false;
+  if (['media', 'audio', 'sticker'].includes(normalized.rawMessageType || normalized.messageType)) return true;
+  return (normalized.downloadPlans || []).some((plan) => ['audio', 'sticker'].includes(plan.materialKind || plan.messageType));
+}
+
+function enqueueMaterialJob(job) {
+  if (materialJobs.length >= cfg.audioTranscribeQueueMax) return { ok: false, reason: 'queue_full' };
+  if (!allowMaterialRate(job.event)) return { ok: false, reason: 'rate_limited' };
+  materialJobs.push(job);
+  drainMaterialJobs();
+  return { ok: true };
+}
+
+function drainMaterialJobs() {
+  while (activeMaterialJobs < cfg.audioTranscribeConcurrency && materialJobs.length > 0) {
+    const job = materialJobs.shift();
+    activeMaterialJobs += 1;
+    processMaterialJob(job)
+      .catch((error) => {
+        log('material job failed', {
+          messageId: job.event?.message_id || job.event?.id || '',
+          error: error.message || String(error),
+        });
+        return reply(job.event?.message_id || job.event?.id, `媒体材料处理失败：${error.message || String(error)}`);
+      })
+      .finally(() => {
+        activeMaterialJobs -= 1;
+        drainMaterialJobs();
+      });
+  }
+}
+
+function allowMaterialRate(event) {
+  const sender = event?.sender_id || 'unknown';
+  const nowMs = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const recent = (materialRate.get(sender) || []).filter((ts) => nowMs - ts < windowMs);
+  if (recent.length >= cfg.audioTranscribePerSenderPerHour) {
+    materialRate.set(sender, recent);
+    return false;
+  }
+  recent.push(nowMs);
+  materialRate.set(sender, recent);
+  return true;
+}
+
+function materialQueueRejectMessage(reason) {
+  if (reason === 'rate_limited') {
+    return '本地媒体处理已达到当前用户的小时限额，请稍后重试。';
+  }
+  return '本地媒体处理队列已满，请稍后重试。';
+}
+
+async function processMaterialJob({ event, normalized, content, sessionName }) {
+  const entry = createInboxEntry(event, normalized, {
+    download: cfg.audioDownload,
+    transcribeAudio: cfg.audioTranscribe !== 'off' && cfg.audioDownload,
+    audioTranscribeConfig: audioTranscribeConfig(),
+    audioTranscribeSendToCodex: cfg.audioTranscribeSendToCodex,
+    transcriptInManifest: cfg.audioTranscriptInManifest,
+  });
+  const promptContent = buildMaterialPromptContent(entry, content);
+  const normalizedForPrompt = {
+    ...entry.normalized,
+    text: promptContent,
+    promptText: promptContent,
+  };
+  await sendToSession(event, sessionName, promptContent, {
+    saveInbox: false,
+    normalized: normalizedForPrompt,
+  });
+}
+
+function audioTranscribeConfig() {
+  return {
+    audioTranscribe: cfg.audioTranscribe,
+    audioTranscribeEngine: cfg.audioTranscribeEngine,
+    audioTranscribeModel: cfg.audioTranscribeModel,
+    audioTranscribeMaxSeconds: cfg.audioTranscribeMaxSeconds,
+    audioTranscribeMaxMb: cfg.audioTranscribeMaxMb,
+    audioTranscribeTimeoutMs: cfg.audioTranscribeTimeoutMs,
+    audioTranscribeLanguage: cfg.audioTranscribeLanguage,
+    audioTranscribeRequireLocal: cfg.audioTranscribeRequireLocal,
+    whisperCppPath: cfg.whisperCppPath,
+    whisperCppModel: cfg.whisperCppModel,
+    mlxWhisperBin: cfg.mlxWhisperBin,
+    fasterWhisperBin: cfg.fasterWhisperBin,
+    mlxWhisperModel: cfg.mlxWhisperModel,
+    fasterWhisperModel: cfg.fasterWhisperModel,
+    audioTranscoder: cfg.audioTranscoder,
+    fakeAudioTranscribePath: cfg.fakeAudioTranscribePath,
+    cwd: ROOT,
+  };
+}
+
+function buildMaterialPromptContent(entry, fallbackContent) {
+  const contentPath = path.join(entry.dir, 'content.md');
+  const content = readTextIfExists(contentPath).trim();
+  return [
+    content || fallbackContent,
+    '',
+    `本地材料目录：${entry.dir}`,
+    '请读取 content.md、manifest.json 和 attachments/ 后处理。message.json 是仅供本地审计的原始消息；除非用户明确要求 raw 原文，不要读取或复述。',
+  ].filter(Boolean).join('\n');
+}
+
 async function handleCommand(event, content) {
   const messageId = event.message_id || event.id;
   const tokens = shellWords(content);
@@ -752,6 +917,7 @@ async function handleCommand(event, content) {
         await reply(messageId, whereamiText(event));
         break;
       case '/use':
+        requireAdmin(event);
         await cmdUse(event, tokens);
         break;
       case '/bind':
@@ -788,6 +954,7 @@ async function handleCommand(event, content) {
         await cmdRestart(event, tokens);
         break;
       case '/file':
+        requireAdmin(event);
         await cmdFile(event, tokens);
         break;
       default:
@@ -840,27 +1007,27 @@ async function cmdUnbind(event) {
 }
 
 async function cmdSend(event, tokens) {
-  const { sessionName, rest } = splitSessionArg(event, tokens);
+  const { sessionName, rest } = splitSessionArg(event, tokens, { requireAdminForExplicit: true });
   const text = rest.join(' ').trim();
   if (!text) throw new Error('用法：/send [session] <text>');
   await sendToSession(event, sessionName, text, { saveInbox: false });
 }
 
 async function cmdCapture(event, tokens) {
-  const sessionName = tokens[0] || resolveSessionName(event);
+  const sessionName = explicitSessionArg(event, tokens);
   const backend = backendFor(getSession(sessionName));
   await reply(event.message_id || event.id, trimReply(await backend.capture(sessionName)));
 }
 
 async function cmdStatus(event, tokens) {
-  const sessionName = tokens[0] || resolveSessionName(event);
+  const sessionName = explicitSessionArg(event, tokens);
   const session = getSession(sessionName);
   const backend = backendFor(session);
   await reply(event.message_id || event.id, await backend.status(sessionName));
 }
 
 async function cmdInterrupt(event, tokens) {
-  const sessionName = tokens[0] || resolveSessionName(event);
+  const sessionName = explicitSessionArg(event, tokens);
   const backend = backendFor(getSession(sessionName));
   await backend.interrupt(sessionName);
   await reply(event.message_id || event.id, `已中断 session: ${sessionName}`);
@@ -920,6 +1087,7 @@ async function cmdFile(event, tokens) {
     as: cfg.larkAs,
     profile: cfg.larkProfile,
     cwd: ROOT,
+    timeoutMs: cfg.larkCliTimeoutMs,
   });
   if (!fetched.ok || !fetched.message) {
     throw new Error(`无法读取消息 ${fileArgs.messageId}：${fetched.failureSummary || 'message get failed'}`);
@@ -938,6 +1106,7 @@ async function cmdFile(event, tokens) {
     as: cfg.larkAs,
     profile: cfg.larkProfile,
     cwd: ROOT,
+    timeoutMs: cfg.larkCliTimeoutMs,
   });
   targetEvent = attachmentHydrated.event;
   normalized = attachmentHydrated.normalized;
@@ -946,6 +1115,7 @@ async function cmdFile(event, tokens) {
     as: cfg.larkAs,
     profile: cfg.larkProfile,
     cwd: ROOT,
+    timeoutMs: cfg.larkCliTimeoutMs,
   });
   targetEvent = mergeHydrated.event;
   normalized = mergeHydrated.normalized;
@@ -976,8 +1146,18 @@ function parseFileCommandArgs(tokens) {
   return { messageId, rest };
 }
 
-function splitSessionArg(event, tokens) {
+function explicitSessionArg(event, tokens) {
+  if (tokens[0]) {
+    if (!state.sessions[tokens[0]]) throw new Error(`session 不存在：${tokens[0]}`);
+    requireAdmin(event);
+    return tokens[0];
+  }
+  return resolveSessionName(event);
+}
+
+function splitSessionArg(event, tokens, options = {}) {
   if (tokens[0] && state.sessions[tokens[0]]) {
+    if (options.requireAdminForExplicit) requireAdmin(event);
     return { sessionName: tokens[0], rest: tokens.slice(1) };
   }
   return { sessionName: resolveSessionName(event), rest: tokens };
@@ -998,7 +1178,7 @@ async function sendToSession(event, sessionName, content, opts = {}) {
     if (isManuallyStoppedSession(session)) throw stoppedSessionError(sessionName);
     activeTurnId = startActiveTurn(event, sessionName, content, opts.normalized);
     const inbox = opts.saveInbox ? createInboxEntry(event, opts.normalized) : null;
-    const prompt = buildPrompt(event, content, sessionName, inbox?.dir);
+    const prompt = buildPrompt(event, content, sessionName, inbox?.dir, opts.normalized);
     await maybeReactPhase1(event, content);
     stream = createStreamingReplyController(event.message_id || event.id, content, {
       coldStart: shouldShowColdStartCard(sessionName, session),
@@ -1066,6 +1246,7 @@ function startActiveTurn(event, sessionName, content, normalized = null) {
 }
 
 function activeTurnContentPreview(normalized, content) {
+  if (normalized?.activePreview) return String(normalized.activePreview).slice(0, 200);
   if (normalized?.messageType === 'merge_forward') {
     return mergeForwardContentPreview(normalized);
   }
@@ -2037,13 +2218,15 @@ function hasTmuxSession(tmuxSession) {
   return spawnSync('tmux', ['has-session', '-t', tmuxSession], { encoding: 'utf8' }).status === 0;
 }
 
-function createInboxEntry(event, normalized) {
+function createInboxEntry(event, normalized, options = {}) {
   return createInboxEntryLike(event, {
     inboxRoot: INBOX_DIR,
     larkAs: cfg.larkAs,
     larkProfile: cfg.larkProfile,
     normalized,
     download: true,
+    larkCliTimeoutMs: cfg.larkCliTimeoutMs,
+    ...options,
   });
 }
 
@@ -2068,14 +2251,17 @@ function createReaction(messageId, emojiType, phase) {
     encoding: 'utf8',
     cwd: ROOT,
     maxBuffer: 4 * 1024 * 1024,
+    timeout: cfg.larkCliTimeoutMs,
   });
   if (result.status !== 0) {
     log('reaction failed', {
       messageId,
       emojiType,
       phase,
-      stderr: result.stderr.trim(),
-      stdout: result.stdout.trim(),
+      status: result.status,
+      signal: result.signal,
+      stderr: commandOutputSummary(result.stderr),
+      stdout: commandOutputSummary(result.stdout),
     });
     return;
   }
@@ -2120,8 +2306,9 @@ function createStreamingReplyController(parentMessageId, inputText, options = {}
     if (!sent.ok || !sent.messageId) {
       log('streaming reply start failed', {
         parentMessageId,
-        stderr: sent.stderr || '',
-        stdout: sent.stdout || '',
+        status: sent.status,
+        stderr: commandOutputSummary(sent.stderr),
+        stdout: commandOutputSummary(sent.stdout),
       });
       return false;
     }
@@ -2147,8 +2334,9 @@ function createStreamingReplyController(parentMessageId, inputText, options = {}
       if (!patched.ok) {
         log('streaming reply patch failed', {
           messageId: result.messageId,
-          stderr: patched.stderr,
-          stdout: patched.stdout,
+          status: patched.status,
+          stderr: commandOutputSummary(patched.stderr),
+          stdout: commandOutputSummary(patched.stdout),
         });
       }
       return patched.ok;
@@ -2163,8 +2351,9 @@ function createStreamingReplyController(parentMessageId, inputText, options = {}
       if (!patched.ok) {
         log('streaming reply final patch failed', {
           messageId: result.messageId,
-          stderr: patched.stderr,
-          stdout: patched.stdout,
+          status: patched.status,
+          stderr: commandOutputSummary(patched.stderr),
+          stdout: commandOutputSummary(patched.stdout),
         });
         deleteMessage(result.messageId);
       }
@@ -2197,25 +2386,42 @@ async function reply(messageId, text) {
     log(`rich reply failed; falling back to text`, {
       messageId,
       msgType: rendered?.msg_type || 'text',
-      stderr: result.stderr.trim(),
-      stdout: result.stdout.trim(),
+      status: result.status,
+      signal: result.signal,
+      stderr: commandOutputSummary(result.stderr),
+      stdout: commandOutputSummary(result.stdout),
     });
     const fallback = sendTextReply(messageId, body);
     if (fallback.status !== 0) {
-      log(`reply failed`, { messageId, stderr: fallback.stderr.trim(), stdout: fallback.stdout.trim() });
-      audit('reply_failed', { message_id: messageId }, { stderr: fallback.stderr.trim(), stdout: fallback.stdout.trim() });
+      log(`reply failed`, {
+        messageId,
+        status: fallback.status,
+        signal: fallback.signal,
+        stderr: commandOutputSummary(fallback.stderr),
+        stdout: commandOutputSummary(fallback.stdout),
+      });
+      audit('reply_failed', { message_id: messageId }, {
+        status: fallback.status,
+        signal: fallback.signal,
+        stderr: commandOutputSummary(fallback.stderr),
+        stdout: commandOutputSummary(fallback.stdout),
+      });
       return;
     }
   }
   log(`replied`, { messageId, msgType: rendered?.msg_type || 'text' });
-  audit('outbound', { message_id: messageId }, { text: body.slice(0, 500), msgType: rendered?.msg_type || 'text' });
+  audit('outbound', { message_id: messageId }, {
+    replyLength: body.length,
+    replySha256: sha256(body).slice(0, 16),
+    msgType: rendered?.msg_type || 'text',
+  });
 }
 
 function sendTextReply(messageId, text) {
   return spawnSync(
     'lark-cli',
     larkCliArgs(['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--text', text]),
-    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024, timeout: cfg.larkCliTimeoutMs },
   );
 }
 
@@ -2223,7 +2429,7 @@ function sendReplyPayload(messageId, payload) {
   const result = spawnSync(
     'lark-cli',
     larkCliArgs(['im', '+messages-reply', '--as', cfg.larkAs, '--message-id', messageId, '--msg-type', payload.msg_type, '--content', payload.content]),
-    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024, timeout: cfg.larkCliTimeoutMs },
   );
   return {
     ...result,
@@ -2238,7 +2444,7 @@ function patchMessagePayload(messageId, payload) {
   const result = spawnSync(
     'lark-cli',
     larkCliArgs(['api', 'PATCH', `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, '--as', cfg.larkAs, '--data', JSON.stringify({ content: payload.content })]),
-    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024 },
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 8 * 1024 * 1024, timeout: cfg.larkCliTimeoutMs },
   );
   return {
     ok: result.status === 0,
@@ -2252,13 +2458,15 @@ function deleteMessage(messageId) {
   const result = spawnSync(
     'lark-cli',
     larkCliArgs(['im', 'messages', 'delete', '--as', cfg.larkAs, '--params', JSON.stringify({ message_id: messageId })]),
-    { encoding: 'utf8', cwd: ROOT, maxBuffer: 4 * 1024 * 1024 },
+    { encoding: 'utf8', cwd: ROOT, maxBuffer: 4 * 1024 * 1024, timeout: cfg.larkCliTimeoutMs },
   );
   if (result.status !== 0) {
     log('delete message failed', {
       messageId,
-      stderr: String(result.stderr || '').trim(),
-      stdout: String(result.stdout || '').trim(),
+      status: result.status,
+      signal: result.signal,
+      stderr: commandOutputSummary(result.stderr),
+      stdout: commandOutputSummary(result.stdout),
     });
   }
 }

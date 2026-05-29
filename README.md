@@ -55,10 +55,11 @@ farctl --name sales --env .env.sales --home ~/.feishu-agent-router-sales \
 
 `allowlist-capture` prints full `sender_id` and `chat_id` only to local stdout;
 the router log keeps policy blocks scoped to redacted IDs and remediation text.
-The router fails closed when both `FTB_ALLOWED_SENDERS` and `FTB_ALLOWED_CHATS`
-are empty. Set `FTB_ALLOW_UNRESTRICTED=true` only for an intentionally public
-bridge. Admin commands require `FTB_ADMIN_USERS`; set `FTB_ALLOW_ADMIN_ALL=true`
-only when every allowed sender should be treated as an admin.
+The router fails closed when `FTB_ALLOWED_SENDERS` is empty. `FTB_ALLOWED_CHATS`
+is an additional scope constraint, not a replacement for sender allowlisting.
+Set `FTB_ALLOW_UNRESTRICTED=true` only for an intentionally public bridge.
+Admin commands require `FTB_ADMIN_USERS`; set `FTB_ALLOW_ADMIN_ALL=true` only
+when every allowed sender should be treated as an admin.
 Because it consumes the same Feishu event stream as the router, `farctl
 allowlist-capture` refuses while the matching launchd service is loaded. Stop
 that instance first, capture the IDs, then start it again.
@@ -219,10 +220,16 @@ Admin-only commands:
 ```text
 /bind
 /unbind
+/use
 /new
 /stop
 /restart
+/file
 ```
+
+For non-admin users, `/send`, `/capture`, `/status`, and `/interrupt` can only
+target the session resolved from the current Feishu chat/thread/user context.
+Supplying an explicit session name is admin-only.
 
 `/interrupt` and `/status` bypass the normal per-turn delivery queue so they
 can still respond while a long Codex turn is running. `/stop` marks a
@@ -285,10 +292,16 @@ Phase 1: router MVP
 
 Phase 2: office materials
 
-- Inbound text/post/image/file/video/merge-forward messages are normalized
+- Inbound text/post/image/file/video/media/audio/sticker/merge-forward messages are normalized
+- Business-card and special message types (`interactive`, `share_user`,
+  `share_chat`, `location`, `system`, and future unknown types) are staged as
+  `materialKind=business_card` with `businessCards[]` summaries instead of
+  falling back to plain unsupported text
 - Merge-forward messages are expanded by fetching child messages through
   `GET /open-apis/im/v1/messages/{message_id}` before they are sent to Codex
-- Image/file/video events that arrive without a downloadable key are hydrated
+- Merge-forward child business cards are included in `businessCards[]` with
+  child index, child message id, and sender label
+- Image/file/video/media/audio/sticker events that arrive without a downloadable key are hydrated
   through `GET /open-apis/im/v1/messages/{message_id}` so `body.content` can be
   parsed before resource download plans are created
 - Non-text messages and explicit `/file --message-id <message_id>` captures are
@@ -296,13 +309,28 @@ Phase 2: office materials
 - `message.json`, `content.md`, and `manifest.json` are created
 - Inbox directories are written with `0700` permissions and inbox files with
   `0600` permissions
-- The router tries Feishu official resource download for image/file/video
+- The router tries Feishu official resource download for image/file/video/media/audio/sticker
   attachments only when a concrete file key is available
+- Business-card URLs are sanitized in `content.md`, `manifest.json`, and Codex
+  prompts; original URLs remain only in private `message.json`
+- Business-card logs, audit previews, and active-turn previews are structural
+  only and never include raw card JSON, callback payloads, URL query strings, or
+  precise location coordinates
 - Local inbox paths are passed to the backend session
 - Merge-forward parsing requires the bot/profile to have message-read access to
   the source chat; common missing scopes are `im:message.group_msg` and
   `contact:user.base:readonly`
-- Voice transcription is intentionally not included in this phase
+- Audio messages are downloaded and transcribed locally by default after
+  allowlist checks. The router does not call Feishu STT or hosted APIs; if no
+  local ASR engine/model is available, it keeps the downloaded audio and sends a
+  safe diagnostic instead of blocking the message.
+- Set `FTB_AUDIO_DOWNLOAD=false` to skip audio/media resource downloads. Set
+  `FTB_AUDIO_TRANSCRIBE_SEND_TO_CODEX=false` to keep transcript text only in the
+  private transcript file instead of in `content.md`/Codex prompt.
+- External `lark-cli` fetch/download/reply calls use `FTB_LARK_CLI_TIMEOUT_MS`
+  so a stalled Feishu API command cannot hang forever.
+- Ordinary text/post logs, audit previews, and active-turn previews are
+  structural (`chars` + hash) rather than raw message content.
 
 Phase 3: multi-agent routing
 
