@@ -332,10 +332,11 @@ function writePlist() {
   fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
   const next = renderPlist();
   if (!fs.existsSync(PLIST_PATH)) {
-    fs.writeFileSync(PLIST_PATH, next);
+    fs.writeFileSync(PLIST_PATH, next, { mode: 0o600 });
     console.log(`Installed ${PLIST_PATH}`);
     return;
   }
+  fs.chmodSync(PLIST_PATH, 0o600);
   const current = fs.readFileSync(PLIST_PATH, 'utf8');
   if (current !== next) {
     fs.writeFileSync(PLIST_PATH, next);
@@ -369,6 +370,15 @@ function domainTarget() {
 }
 
 function renderPlist() {
+  const instanceEnv = readDotEnv(ENV_PATH);
+  const proxyKeys = [
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  ];
+  // Pin only explicitly configured proxies above launchd's inherited environment.
+  const proxyEnv = Object.fromEntries(
+    proxyKeys.filter((key) => Object.hasOwn(instanceEnv, key)).map((key) => [key, instanceEnv[key]]),
+  );
   const envObject = {
     PATH: [
       path.dirname(NODE),
@@ -383,6 +393,7 @@ function renderPlist() {
     FTB_HOME,
     FTB_ENV_PATH: ENV_PATH,
     ...(INSTANCE_NAME ? { FTB_INSTANCE_NAME: INSTANCE_NAME } : {}),
+    ...proxyEnv,
   };
 
   return `<?xml version="1.0" encoding="UTF-8"?>

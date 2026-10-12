@@ -35,6 +35,50 @@ test('farctl plist isolates named instances by label and runtime home', () => {
   assert.match(result.stdout, /<key>FTB_HOME<\/key>\n    <string>\/tmp\/far-sales<\/string>/);
 });
 
+test('farctl plist pins explicit instance proxies instead of inherited values', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'farctl-proxy-'));
+  const customEnv = path.join(tmp, 'proxy.env');
+  fs.writeFileSync(customEnv, [
+    'HTTPS_PROXY="http://127.0.0.1:18080"',
+    'NO_PROXY=localhost,127.0.0.1,::1',
+    'http_proxy=',
+    'FUTU_LLM_PROXY_API_KEY=must-not-appear-in-plist',
+    '',
+  ].join('\n'));
+
+  const result = spawnSync(process.execPath, [
+    farctl, '--env', customEnv, '--home', path.join(tmp, 'runtime'), 'plist',
+  ], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      HTTPS_PROXY: 'http://inherited.invalid:8080',
+      NO_PROXY: 'inherited.invalid',
+      http_proxy: 'http://inherited.invalid:8081',
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /<key>HTTPS_PROXY<\/key>\n    <string>http:\/\/127\.0\.0\.1:18080<\/string>/);
+  assert.match(result.stdout, /<key>NO_PROXY<\/key>\n    <string>localhost,127\.0\.0\.1,::1<\/string>/);
+  assert.match(result.stdout, /<key>http_proxy<\/key>\n    <string><\/string>/);
+  assert.doesNotMatch(result.stdout, /inherited\.invalid|must-not-appear-in-plist|FUTU_LLM_PROXY_API_KEY/);
+});
+
+test('farctl plist does not persist proxies absent from the instance env', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'farctl-no-proxy-'));
+  const customEnv = path.join(tmp, 'empty.env');
+  fs.writeFileSync(customEnv, '');
+  const result = spawnSync(process.execPath, [
+    farctl, '--env', customEnv, '--home', path.join(tmp, 'runtime'), 'plist',
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, HTTPS_PROXY: 'http://inherited.invalid:8080' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /<key>HTTPS_PROXY<\/key>|inherited\.invalid/);
+});
+
 test('farctl allowlist-capture dry-run pins profile and keeps stdin open', () => {
   const result = spawnSync(
     process.execPath,
@@ -122,6 +166,7 @@ test('farctl start rewrites an existing plist when env or home changes', () => {
   assert.match(second.stdout, /Updated .*com\.feishu-agent-router\.sales\.plist/);
 
   const plist = fs.readFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.feishu-agent-router.sales.plist'), 'utf8');
+  assert.equal(fs.statSync(path.join(home, 'Library', 'LaunchAgents', 'com.feishu-agent-router.sales.plist')).mode & 0o777, 0o600);
   assert.match(plist, new RegExp(escapeRegExp(newEnv)));
   assert.match(plist, new RegExp(escapeRegExp(path.join(tmp, 'new-home'))));
   assert.doesNotMatch(plist, new RegExp(escapeRegExp(path.join(tmp, 'old-home'))));
