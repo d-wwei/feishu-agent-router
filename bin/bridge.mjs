@@ -63,6 +63,7 @@ import {
   CodexTurnTimeoutController,
   summarizeTurnDiagnostics,
 } from '../lib/codex-turn-timeout.mjs';
+import { codexActivityDetail, formatInactivityNotice } from '../lib/codex-turn-observation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(__filename), '..');
@@ -120,8 +121,8 @@ const cfg = {
   codexAppServerListen: env('FTB_CODEX_APP_SERVER_LISTEN', ''),
   codexRequestTimeoutMs: intEnv('FTB_CODEX_REQUEST_TIMEOUT_MS', 120_000),
   codexStartTimeoutMs: intEnv('FTB_CODEX_START_TIMEOUT_MS', 8_000),
-  codexFirstOutputTimeoutMs: intEnv('FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', 90_000),
-  codexTurnIdleTimeoutMs: intEnv('FTB_CODEX_TURN_IDLE_TIMEOUT_MS', 300_000),
+  codexFirstOutputTimeoutMs: nonNegativeIntEnv('FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS', 90_000),
+  codexTurnIdleTimeoutMs: nonNegativeIntEnv('FTB_CODEX_TURN_IDLE_TIMEOUT_MS', 300_000),
   codexTurnHardTimeoutMs: nonNegativeIntEnv('FTB_CODEX_TURN_HARD_TIMEOUT_MS', 0),
   codexExecTimeoutMs: intEnv('FTB_CODEX_EXEC_TIMEOUT_MS', 120_000),
   codexProfile: env('FTB_CODEX_PROFILE', ''),
@@ -194,6 +195,12 @@ const larkBotLock = acquireLarkBotLock();
 clearStartupActiveTurn();
 
 log(`starting router`, { root: ROOT, home: HOME_DIR, larkProfile: cfg.larkProfile || undefined, larkAppId: cfg.larkAppId || undefined });
+log('codex inactivity policy configured', {
+  policy: 'warn-only',
+  firstActivityWarningMs: cfg.codexFirstOutputTimeoutMs,
+  idleWarningMs: cfg.codexTurnIdleTimeoutMs,
+  hardTimeoutMs: cfg.codexTurnHardTimeoutMs,
+});
 if (cfg.idleStopMs > 0) {
   setInterval(stopIdleSessions, Math.min(cfg.idleStopMs, 60_000)).unref?.();
 }
@@ -1185,6 +1192,10 @@ async function sendToSession(event, sessionName, content, opts = {}) {
     });
     const result = await runSessionWithFallback(sessionName, backend, prompt, {
       onDelta: (deltaText) => stream?.update(deltaText),
+      onInactivity: (notice) => reply(
+        event.message_id || event.id,
+        formatInactivityNotice(notice, sessionName),
+      ),
       timing,
     });
     const { output, elapsedMs, stable, backendName: resultBackendName, fallbackReason } = result;
@@ -1555,33 +1566,80 @@ class CodexAppServerClient {
     return result;
   }
 
-  async turnStart(params, opts = {}) {
+  turnStart(params, opts = {}) {
     const turnStartedAt = Date.now();
-    const result = await this.request('turn/start', params);
-    const turnId = result.turn.id;
     return new Promise((resolve, reject) => {
-      const turn = {
-        threadId: params.threadId,
-        turnId,
-        text: '',
-        final: '',
-        lastError: null,
-        onDelta: opts.onDelta,
-        startedAt: turnStartedAt,
-        timing: opts.timing,
-        resolve,
-        reject,
-      };
-      turn.timeoutController = new CodexTurnTimeoutController({
-        turn,
-        firstActivityTimeoutMs: cfg.codexFirstOutputTimeoutMs,
-        idleTimeoutMs: cfg.codexTurnIdleTimeoutMs,
-        hardTimeoutMs: cfg.codexTurnHardTimeoutMs,
-        onTimeout: (kind, error) => this.timeoutTurn(turnId, kind, error),
-      });
-      this.turns.set(turnId, turn);
-      turn.timeoutController.start();
+      // Register synchronously before processing the next line of the same packet.
+      this.request('turn/start', params, cfg.codexRequestTimeoutMs, (result) => {
+        const turnId = result.turn.id;
+        const turn = {
+          threadId: params.threadId,
+          turnId,
+          text: '',
+          final: '',
+          lastError: null,
+          onDelta: opts.onDelta,
+          onInactivity: opts.onInactivity,
+          startedAt: turnStartedAt,
+          timing: opts.timing,
+          resolve,
+          reject,
+        };
+        turn.timeoutController = new CodexTurnTimeoutController({
+          turn,
+          firstActivityTimeoutMs: cfg.codexFirstOutputTimeoutMs,
+          idleTimeoutMs: cfg.codexTurnIdleTimeoutMs,
+          hardTimeoutMs: cfg.codexTurnHardTimeoutMs,
+          onTimeout: (kind, error) => this.timeoutTurn(turnId, kind, error),
+          onInactivity: (notice) => {
+            this.observeInactiveTurn(turnId, notice).catch(() => {
+              log('inactivity observation failed; turn retained', { turnId });
+            });
+          },
+        });
+        this.turns.set(turnId, turn);
+        turn.timeoutController.start();
+      }).catch(reject);
     });
+  }
+
+  async observeInactiveTurn(turnId, notice) {
+    const turn = this.turns.get(turnId);
+    if (!turn) return;
+    const activityVersion = turn.timeoutController.activityVersion;
+    let health = 'unconfirmed';
+    try {
+      await this.request('thread/read', {
+        threadId: turn.threadId,
+        includeTurns: false,
+      }, Math.min(cfg.codexRequestTimeoutMs, 5_000));
+      health = 'responding';
+    } catch {
+      // A failed health query is not proof that the ongoing task has failed.
+    }
+    if (
+      this.turns.get(turnId) !== turn ||
+      turn.timeoutController.activityVersion !== activityVersion ||
+      turn.manualInterruptRequested
+    ) return;
+    const observation = {
+      kind: notice.kind,
+      thresholdMs: notice.thresholdMs,
+      health,
+      observedAt: now(),
+      lastActivityType: notice.diagnostics.lastActivityType,
+    };
+    turn.inactivity = observation;
+    log('codex turn inactive; continuing without interruption', {
+      threadId: turn.threadId,
+      turnId,
+      ...observation,
+    });
+    try {
+      await turn.onInactivity?.(observation);
+    } catch {
+      log('inactivity notification failed; turn retained', { turnId });
+    }
   }
 
   timeoutTurn(turnId, kind, error) {
@@ -1607,14 +1665,16 @@ class CodexAppServerClient {
     if (!threadId) return;
     for (const [turnId, turn] of this.turns.entries()) {
       if (turn.threadId === threadId) {
+        turn.manualInterruptRequested = true;
         this.request('turn/interrupt', { threadId, turnId }).catch((error) => {
+          turn.manualInterruptRequested = false;
           log('codex turn interrupt failed', { error: error.message || String(error) });
         });
       }
     }
   }
 
-  request(method, params) {
+  request(method, params, timeoutMs = cfg.codexRequestTimeoutMs, onResponse) {
     const id = ++this.requestId;
     this.send({ id, method, params });
     return new Promise((resolve, reject) => {
@@ -1622,8 +1682,20 @@ class CodexAppServerClient {
         if (!this.pending.has(id)) return;
         this.pending.delete(id);
         reject(new Error(`Timed out waiting for ${method}`));
-      }, cfg.codexRequestTimeoutMs);
-      this.pending.set(id, { resolve, reject, method, timer });
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (result) => {
+          try {
+            onResponse?.(result);
+            resolve(result);
+          } catch (error) {
+            reject(error);
+          }
+        },
+        reject,
+        method,
+        timer,
+      });
     });
   }
 
@@ -1671,10 +1743,14 @@ class CodexAppServerClient {
   }
 
   handleNotification(msg) {
+    const activeTurn = this.turns.get(msg.params?.turnId);
+    const activityDetail = codexActivityDetail(msg);
+    if (activeTurn && activityDetail !== null) {
+      this.recordTurnActivity(activeTurn, msg.method, activityDetail);
+    }
     if (msg.method === 'item/agentMessage/delta') {
       const turn = this.turns.get(msg.params.turnId);
       if (turn) {
-        this.recordTurnActivity(turn, msg.method, msg.params.delta);
         turn.text += msg.params.delta || '';
         if (typeof turn.onDelta === 'function') {
           try {
@@ -1689,7 +1765,6 @@ class CodexAppServerClient {
     if (msg.method === 'item/completed') {
       const turn = this.turns.get(msg.params.turnId);
       if (turn) {
-        this.recordTurnActivity(turn, msg.method, describeCodexItem(msg.params.item));
         if (msg.params.item?.type === 'agentMessage') {
           turn.final = msg.params.item.text || turn.text;
         }
@@ -1700,7 +1775,11 @@ class CodexAppServerClient {
       const turn = this.turns.get(msg.params.turnId);
       if (turn) {
         turn.lastError = msg.params.error;
-        this.recordTurnActivity(turn, msg.method, msg.params.error?.message || 'unknown error');
+        if (!msg.params.willRetry) {
+          this.turns.delete(msg.params.turnId);
+          this.clearTurnTimers(turn);
+          turn.reject(new Error(msg.params.error?.message || 'Codex turn failed'));
+        }
       }
       if (!msg.params.willRetry) {
         log('codex turn error', { error: msg.params.error?.message || 'unknown error' });
@@ -1716,24 +1795,24 @@ class CodexAppServerClient {
       if (turn.timing) turn.timing.turnCompletedMs = Date.now() - turn.startedAt;
       if (msg.params.turn.status === 'failed') {
         turn.reject(new Error(msg.params.turn.error?.message || turn.lastError?.message || 'Codex turn failed'));
+      } else if (msg.params.turn.status === 'interrupted') {
+        turn.reject(new Error('Codex turn interrupted'));
       } else {
         turn.resolve(turn.final || turn.text || '');
       }
       return;
     }
     if (msg.method === 'warning') {
-      const turn = this.turns.get(msg.params?.turnId);
-      if (turn) this.recordTurnActivity(turn, msg.method, msg.params?.message || JSON.stringify(msg.params));
       log('codex warning', { message: msg.params?.message || JSON.stringify(msg.params) });
       return;
     }
-    const turn = this.turns.get(msg.params?.turnId);
-    if (turn) this.recordTurnActivity(turn, msg.method, JSON.stringify(msg.params || {}).slice(0, 500));
   }
 
   handleServerRequest(msg) {
     const turn = this.turns.get(msg.params?.turnId);
-    if (turn) this.recordTurnActivity(turn, msg.method, describeServerRequest(msg));
+    if (turn && isCodexUserVisibleServerRequest(msg.method)) {
+      this.recordTurnActivity(turn, msg.method, describeServerRequest(msg));
+    }
     if (
       msg.method === 'item/commandExecution/requestApproval' ||
       msg.method === 'item/fileChange/requestApproval'
@@ -1796,6 +1875,7 @@ class CodexAppServerClient {
 
   recordTurnActivity(turn, type, detail = null) {
     turn.timeoutController?.recordActivity(type, detail);
+    turn.inactivity = null;
   }
 
   clearTurnTimers(turn) {
@@ -1806,10 +1886,32 @@ class CodexAppServerClient {
     return this.transport ? `running ${this.listenUrl}` : 'stopped';
   }
 
+  threadStatusText(threadId) {
+    const turn = [...this.turns.values()].find((item) => item.threadId === threadId);
+    if (!turn) return 'turn: none';
+    const silenceMs = Date.now() - (turn.lastActivityAt ?? turn.startedAt);
+    return [
+      `turn: ${turn.turnId} (${turn.manualInterruptRequested ? 'interrupt requested' : 'running'})`,
+      `last activity: ${turn.lastActivityType || 'none'} (${Math.round(silenceMs / 1000)}s ago)`,
+      turn.inactivity ? `inactivity: warning only; health=${turn.inactivity.health}; task retained` : '',
+    ].filter(Boolean).join('\n');
+  }
+
   close() {
     try { this.transport?.close(); } catch {}
     try { this.child?.kill(); } catch {}
   }
+}
+
+function isCodexUserVisibleServerRequest(method) {
+  return method === 'item/commandExecution/requestApproval' ||
+    method === 'item/fileChange/requestApproval' ||
+    method === 'item/permissions/requestApproval' ||
+    method === 'item/tool/requestUserInput' ||
+    method === 'mcpServer/elicitation/request' ||
+    method === 'applyPatchApproval' ||
+    method === 'execCommandApproval' ||
+    method === 'item/tool/call';
 }
 
 function backendFor(session) {
@@ -1836,6 +1938,7 @@ const codexAppServerBackend = {
       `backend: codex-app-server`,
       `app-server: ${codexAppServer.statusText()}`,
       `thread: ${session.threadId || '(new)'}`,
+      codexAppServer.threadStatusText(session.threadId),
       `cwd: ${session.cwd || cfg.defaultWorkdir}`,
       '',
       session.lastOutput || '(no last output)',
@@ -1848,6 +1951,7 @@ const codexAppServerBackend = {
       `backend: codex-app-server`,
       `app-server: ${codexAppServer.statusText()}`,
       `thread: ${session.threadId || '(new)'}`,
+      codexAppServer.threadStatusText(session.threadId),
       `cwd: ${session.cwd || cfg.defaultWorkdir}`,
       `model: ${cfg.codexModel || '(Codex default)'}`,
       `effort: ${cfg.codexReasoningEffort || '(default)'}`,

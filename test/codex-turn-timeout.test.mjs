@@ -12,10 +12,11 @@ import {
   isCodexIdleTimeout,
 } from '../lib/codex-turn-timeout.mjs';
 
-test('turn activity clears first-activity timeout and refreshes idle timeout', () => {
+test('turn activity refreshes a non-destructive idle warning', () => {
   const clock = new FakeClock();
   const turn = { threadId: 'thread_1', turnId: 'turn_1', startedAt: 0, text: 'working', timing: {} };
   const timeouts = [];
+  const warnings = [];
   const controller = new CodexTurnTimeoutController({
     turn,
     firstActivityTimeoutMs: 90_000,
@@ -25,6 +26,7 @@ test('turn activity clears first-activity timeout and refreshes idle timeout', (
     setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
     clearTimeout: (id) => clock.clearTimeout(id),
     onTimeout: (kind, error) => timeouts.push({ kind, error }),
+    onInactivity: (notice) => warnings.push(notice),
   });
 
   controller.start();
@@ -38,11 +40,61 @@ test('turn activity clears first-activity timeout and refreshes idle timeout', (
   assert.deepEqual(timeouts, []);
 
   clock.tick(1);
-  assert.equal(timeouts.length, 1);
-  assert.equal(timeouts[0].kind, 'idle');
-  assert.equal(timeouts[0].error.code, CODEX_TURN_IDLE_TIMEOUT);
-  assert.equal(timeouts[0].error.diagnostics.lastActivityType, 'item/completed');
-  assert.equal(timeouts[0].error.diagnostics.lastAgentTextPreview, 'working');
+  assert.deepEqual(timeouts, []);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].kind, 'idle');
+  assert.equal(warnings[0].diagnostics.lastActivityType, 'item/completed');
+  assert.equal(warnings[0].thresholdMs, 300_000);
+});
+
+test('first activity silence warns once and never interrupts or repeats automatically', () => {
+  const clock = new FakeClock();
+  const warnings = [];
+  const timeouts = [];
+  const controller = new CodexTurnTimeoutController({
+    turn: { startedAt: 0 },
+    firstActivityTimeoutMs: 90_000,
+    idleTimeoutMs: 300_000,
+    now: () => clock.now,
+    setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+    clearTimeout: (id) => clock.clearTimeout(id),
+    onInactivity: (notice) => warnings.push(notice),
+    onTimeout: (kind) => timeouts.push(kind),
+  });
+  controller.start();
+  clock.tick(24 * 60 * 60 * 1000);
+  assert.deepEqual(timeouts, []);
+  assert.deepEqual(warnings.map((notice) => notice.kind), ['first-activity']);
+  controller.recordActivity('item/started', 'commandExecution');
+  clock.tick(300_000);
+  clock.tick(24 * 60 * 60 * 1000);
+  assert.deepEqual(timeouts, []);
+  assert.deepEqual(warnings.map((notice) => notice.kind), ['first-activity', 'idle']);
+  controller.recordActivity('item/completed', 'commandExecution');
+  clock.tick(300_000);
+  assert.equal(warnings.length, 3);
+});
+
+test('zero disables inactivity detection and clear prevents late callbacks', () => {
+  const clock = new FakeClock();
+  const warnings = [];
+  const controller = new CodexTurnTimeoutController({
+    turn: { startedAt: 0 },
+    firstActivityTimeoutMs: 0,
+    idleTimeoutMs: 0,
+    onInactivity: (notice) => warnings.push(notice),
+    now: () => clock.now,
+    setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+    clearTimeout: (id) => clock.clearTimeout(id),
+  });
+  controller.start();
+  controller.recordActivity('item/started');
+  assert.equal(clock.timers.size, 0);
+  controller.idleTimeoutMs = 100;
+  controller.recordActivity('item/completed');
+  controller.clear();
+  clock.tick(1000);
+  assert.deepEqual(warnings, []);
 });
 
 test('hard timeout is disabled when configured as 0', () => {

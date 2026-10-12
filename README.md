@@ -398,21 +398,42 @@ By default, the app-server does not override `model_provider`, so Codex inherits
 the user's global Codex profile/provider. For deployments that intentionally
 need the ChatGPT HTTP provider override, set `FTB_CODEX_FORCE_RESPONSES_HTTP=true`;
 that adds a local provider override with `wire_api="responses"` and
-`supports_websockets=false`. The first-output timeout interrupts a turn that
-never starts producing app-server activity. After the first activity, turns use
-an idle timeout instead of a short absolute completion cutoff: any agent delta,
-tool item, approval request, warning, or error refreshes
-`FTB_CODEX_TURN_IDLE_TIMEOUT_MS`. By default there is no hard wall-clock cap:
-`FTB_CODEX_TURN_HARD_TIMEOUT_MS=0` means a long Feishu-triggered turn can keep
-running as long as Codex keeps producing activity. Set it to a positive number
-only if an instance needs an absolute maximum turn duration.
+`supports_websockets=false`.
+
+### Long-running turns: warn, do not interrupt
+
+`FTB_CODEX_FIRST_OUTPUT_TIMEOUT_MS` and `FTB_CODEX_TURN_IDLE_TIMEOUT_MS`
+are now **warning thresholds**, despite their historical names. They never
+interrupt, retry, rebuild a thread, or release the ordinary-message queue.
+Either value can be `0` to disable that detector. A silent period emits at most
+one warning; meaningful new activity rearms the idle detector.
+
+On silence, the bridge makes a read-only `thread/read` query bounded by five
+seconds (or the shorter request timeout), then sends a non-final Feishu warning.
+A responsive server is not proof of task progress. An unsupported or timed-out
+query is reported as unconfirmed, not as task failure. A late query result is
+discarded if the turn completed or activity resumed. Failed warning delivery
+does not cancel the task.
+
+Agent text, reasoning progress, command output, tool progress/start/completion,
+and supported user-facing requests count as activity. Warnings, retries,
+bookkeeping notifications, and unknown events do not. Process exit, transport
+closure, and explicit terminal errors still fail the pending turn.
+
+Ordinary messages remain queued behind a running turn. `/status <session>`
+and `/interrupt <session>` bypass that queue; status includes the last activity
+and any unconfirmed inactivity observation. Manual interruption is not reported
+as successful task completion. Completed side effects are not rolled back.
+
+There is no absolute deadline by default: `FTB_CODEX_TURN_HARD_TIMEOUT_MS=0`.
+A positive value remains an explicit opt-in cancellation deadline. The separate
+request/start timeouts bound protocol operations, not the duration of a task.
 `FTB_PREWARM_CODEX=true` starts the app-server and resumes/creates listed Codex
 threads when the bridge starts, so the first Feishu message no longer pays the
 process/thread cold-start cost. Each app-server turn logs `appServerReadyMs`,
 `threadReadyMs`, `firstOutputMs`, `turnCompletedMs`, `feishuReplyMs`, and
-`totalMs` to `logs/router.log`. Timeout logs include the timeout kind, last
-activity type/detail, elapsed time, idle time, and a short agent-text preview.
-They can be tightened in `.env` per deployment.
+`totalMs` to `logs/router.log`. Inactivity warnings log structural activity
+types and health-check outcomes without copying task output or reasoning text.
 
 `tmux` remains available for explicit terminal-agent sessions. Automatic
 fallback from `codex-app-server` to tmux is disabled by default because a broken
